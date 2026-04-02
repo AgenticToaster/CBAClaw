@@ -2,6 +2,12 @@
 
 set -euo pipefail
 
+# Ensure node/pnpm are on PATH when invoked from GUIs (e.g. Cursor, VS Code)
+# that don't source interactive shell config.
+for p in "$HOME/.local/share/pnpm" "$HOME/.nvm/versions/node"/*/bin "$HOME/.volta/bin" "$HOME/.fnm/aliases/default/bin"; do
+  [ -d "$p" ] && export PATH="$p:$PATH"
+done
+
 ROOT_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 RUN_NODE_TOOL="$ROOT_DIR/scripts/pre-commit/run-node-tool.sh"
 FILTER_FILES="$ROOT_DIR/scripts/pre-commit/filter-staged-files.mjs"
