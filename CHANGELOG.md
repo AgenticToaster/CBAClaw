@@ -3,6 +3,33 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.5.0 — 2026-04-02
+
+Phase 4a: Elevated Action Analysis (EAA) trigger detection.
+
+### Phase 4a: EAA Trigger Detection (`src/consent/eaa-triggers.ts`)
+
+- `evaluateEAATriggers`: main entry point that runs 8 detectors against the current tool invocation context and returns a composite `EAATriggerResult` with fired categories, aggregate severity (0–1), and human-readable summary.
+- 7 trigger categories covering the full taxonomy from the Consent-Bound Agency framework (PDF Section V.B):
+  - `standing-ambiguity`: fires when the requestor is not the agent owner. Severity escalates for group/public channel context and high-risk effects.
+  - `effect-ambiguity`: fires when Phase 3b `assessRequestAmbiguity` flags an underspecified request (best vector distance > 0.6) AND the tool involves high-risk effects. Severity scales with vector distance.
+  - `duty-collision`: fires when the tool's effects conflict with registered `DutyConstraint` entries. Severity driven by the highest-criticality colliding duty (advisory 0.5, strong 0.7, inviolable 1.0).
+  - `novelty-uncertainty`: fires for external trust-tier tools with risky effects (disclose, irreversible, persist, exec, physical), and unconditionally for tools on the dangerous tool list (`DEFAULT_GATEWAY_HTTP_TOOL_DENY`).
+  - `insufficient-evidence`: fires when the tool has high-risk effects but there are no consent records in scope and no ambiguity assessment — the system lacks grounded context for risk judgment.
+  - `irreversibility`: fires when tool effects include `irreversible` and no prior explicit, non-expired consent record covers that effect class.
+  - `emergency-time-pressure`: fires for physical effects with urgency markers in the request text (emergency, urgent, immediately, ASAP, critical, danger, life-threatening). Severity 1.0 with strict post-hoc accountability requirements.
+- `DutyConstraint` type: registered obligations with `protects` (evidence, confidentiality, safety, privacy, oversight), `conflictingEffects`, `criticality` (advisory, strong, inviolable), and human-readable description.
+- `DEFAULT_DUTY_CONSTRAINTS`: 5 core system duties — evidence preservation (strong), confidentiality (strong), safety (inviolable), privacy (strong), oversight (strong).
+- Dangerous tool detection sourced from `src/security/dangerous-tools.ts` (`DEFAULT_GATEWAY_HTTP_TOOL_DENY`).
+- Testable clock seam for deterministic time-dependent logic in `detectIrreversibility`.
+- Testing seam exposing individual detector functions and all internal constants.
+
+### Phase 4a: Tests
+
+- `src/consent/eaa-triggers.test.ts`: 55 tests — no-trigger baseline, standing ambiguity (owner/non-owner, group/public context, high-risk escalation, severity cap), effect ambiguity (absent/below-threshold/safe-effects exclusion, severity scaling by distance), duty collision (default duties, custom duties, no-conflict exclusion, multi-duty criticality, collision reporting), novelty uncertainty (external/in-process/sandboxed, safe-effects exclusion), dangerous tool list (exec/gateway/fs_delete, safe tools, unknown tools), insufficient evidence (high-risk without context, suppression by records, suppression by ambiguity, safe-effects exclusion, end-to-end), irreversibility (no consent, prior consent suppression, expired/denied consent, non-expired consent, no irreversible effects), emergency time pressure (urgency keywords, non-urgent physical, urgent non-physical), composite evaluation (multi-trigger, max severity, category deduplication, summary concatenation), default duty constraint validation, testing seam constants.
+
+---
+
 ## 0.4.0 — 2026-04-02
 
 Phase 3b/3c/3d: Change Order flow, consent record persistence, and revocation/withdrawal.

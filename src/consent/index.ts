@@ -146,3 +146,14 @@ export type {
   WithdrawCommitmentParams,
 } from "./revocation.js";
 export { resetConsentSession, revokeConsent, withdrawCommitment } from "./revocation.js";
+
+// Phase 4a: EAA Trigger Detection
+export type {
+  DutyConstraint,
+  DutyCriticality,
+  DutyProtectionTarget,
+  EAATriggerCategory,
+  EAATriggerResult,
+  EvaluateEAATriggersParams,
+} from "./eaa-triggers.js";
+export { DEFAULT_DUTY_CONSTRAINTS, evaluateEAATriggers } from "./eaa-triggers.js";

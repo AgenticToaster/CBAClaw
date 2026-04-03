@@ -23,8 +23,17 @@ todos:
   - id: phase-3d-revocation
     content: "Revocation and withdrawal: /cancel and session reset wiring, WO invalidation, consent record cleanup"
     status: completed
-  - id: phase-4-eaa
-    content: "Build Elevated Action Analysis: trigger detection (uses ambiguity score from 3b), structured adjudication loop, EAA artifact production, system prompt updates for consent-aware agent behavior"
+  - id: phase-4a-triggers
+    content: "EAA trigger detection: standing/role ambiguity, effect ambiguity via Phase 3b assessRequestAmbiguity, duty collision against DutyConstraint registry, external trust tier, dangerous tool list, irreversibility without prior consent, emergency time pressure"
+    status: completed
+  - id: phase-4b-adjudication
+    content: "EAA adjudication loop: 6-step structured process (classify, discover, evaluate via LLM, select least invasive action, choose outcome, produce artifacts). Two artifacts: EAAAdjudicationResult (bounded, to binder) + EAAReasoningRecord (opaque, for audit). Inject LLM via EAAInferenceFn."
+    status: pending
+  - id: phase-4c-integration
+    content: "EAA orchestration integration: handleConsentFailure wiring into verifyToolConsent failure path, precedent reuse check, EAA-to-CO handoff for request-consent outcome, binder anchor verification for eaa anchors, successor WO minting from adjudication results"
+    status: pending
+  - id: phase-4d-system-prompt
+    content: "System prompt updates: effect awareness block, consent boundary recognition, CO participation instructions, EAA slow-down awareness, refusal-as-discretion framing"
     status: pending
   - id: phase-5-policies
     content: "Standing policies with bounding boxes, policy classes (user/self-minted/system), dynamic skill trust tiers, effect profiles for plugin tools. Pattern store reusable for natural-language policy matching."
@@ -280,37 +289,355 @@ Avoid redundant CO prompts by matching new CO requests against prior consent rec
 
 ## Phase 4: Elevated Action Analysis (EAA)
 
+EAA is the agent's deliberate reasoning mode for forming its commitment under uncertainty. It is invoked when naive "implied consent plus requalification" is insufficient: standing is unclear, effects are ambiguous, duties collide, or the environment is uncertain. EAA does not grant authority; it produces structured recommendations that the deterministic binder can verify and bind.
+
+**Key invariant (from PDF Section V.D)**: EAA may recommend contract terms, constraints, and a minimal capability bundle. Only deterministic contract binding may mint or requalify the Work Order. The separation of reasoning (probabilistic, advisory) from binding (deterministic, authoritative) is absolute.
+
+**Two output artifacts (from PDF Section III.C)**:
+
+1. **EAA Adjudication Result** — bounded schema admissible to the binder: outcome type, effect classes, constraints, and a verifiable reference to the full record.
+2. **EAA Reasoning Record** — full evidence/duty/option analysis carried as opaque context for audit. The binder must NOT parse or "evaluate for merit" the reasoning record at mint time.
+
 ### 4a. EAA Trigger Detection
 
-Create `src/consent/eaa-triggers.ts`. EAA is triggered when:
+Create `src/consent/eaa-triggers.ts`.
 
-- Standing/role is ambiguous (sender not owner, channel is group, etc.)
-- Effect boundary is underspecified — detected via the **request ambiguity score** from Phase 3b-vec (`assessRequestAmbiguity`): if `bestDistance > 0.6` AND derived effects include `irreversible`, `elevated`, `disclose`, or `audience-expand`, trigger EAA
-- Duty collision detected (e.g., delete request vs. evidence preservation)
-- Tool has `trustTier: "external"` and involves `disclose` or `irreversible` effects
-- Tool is in `DANGEROUS_ACP_TOOL_NAMES` (already flagged in `[src/security/dangerous-tools.ts](src/security/dangerous-tools.ts)`)
+#### Trigger Conditions (from PDF Section V.B)
+
+EAA is warranted when one or more of the following is true. The unifying criterion: the agent cannot confidently determine the proper scope of work from the request and current contract state alone.
+
+```typescript
+export type EAATriggerCategory =
+  | "standing-ambiguity" // unclear if requestor has authority over affected interests
+  | "effect-ambiguity" // unclear what effects the request implies
+  | "insufficient-evidence" // lacking grounded context for safety/proportionality judgment
+  | "duty-collision" // requested effect conflicts with non-negotiable obligations
+  | "emergency-time-pressure" // action may be required before consent can be obtained
+  | "novelty-uncertainty" // dynamic skills or external services with unknown side effects
+  | "irreversibility"; // contemplated action is difficult/impossible to undo
+
+export type EAATriggerResult = {
+  triggered: boolean;
+  categories: EAATriggerCategory[];
+  /** Severity score 0-1 driving EAA depth. Higher = more thorough analysis. */
+  severity: number;
+  /** Human-readable summary for logging and explainability. */
+  summary: string;
+};
+```
+
+#### Detection Logic
+
+```typescript
+export function evaluateEAATriggers(params: {
+  po: PurchaseOrder;
+  activeWO: WorkOrder;
+  toolName: string;
+  toolProfile: ToolEffectProfile;
+  /** Ambiguity assessment from Phase 3b pattern store vector search. */
+  ambiguity?: AmbiguityAssessment;
+  /** Current consent records in scope. */
+  consentRecords: readonly ConsentRecord[];
+  /** Known system duty constraints (evidence preservation, confidentiality, etc.). */
+  dutyConstraints?: DutyConstraint[];
+}): EAATriggerResult;
+```
+
+Specific trigger rules:
+
+1. **Standing/role ambiguity**: `!po.senderIsOwner`, or channel context is group/public, or the PO's `senderId` is not in the agent's owner/operator allowlist. Severity: 0.5–0.8 depending on effect risk.
+
+2. **Effect ambiguity (Phase 3b integration)**: `ambiguity.ambiguous === true` AND `ambiguity.bestDistance > 0.6` AND derived effects include any of `HIGH_RISK_EFFECTS` (`irreversible`, `elevated`, `disclose`, `audience-expand`, `exec`, `physical`). Severity: scaled by `bestDistance` (further = higher severity).
+
+3. **Duty collision**: compare `toolProfile.effects` against registered `DutyConstraint[]`. For example, a `persist` + `irreversible` (deletion) effect against an `evidence-preservation` duty; a `disclose` effect against a `confidentiality` duty. Severity: 0.7–1.0 depending on duty criticality.
+
+4. **External trust tier**: `toolProfile.trustTier === "external"` AND effects include `disclose`, `irreversible`, or `persist`. Out-of-band execution cannot be fully constrained by the agent's contract mechanisms. Severity: 0.6.
+
+5. **Dangerous tool list**: tool is in `DANGEROUS_ACP_TOOL_NAMES` (from `src/security/dangerous-tools.ts`) regardless of declared effects. Severity: 0.8.
+
+6. **Irreversibility check**: effects include `irreversible` and no prior explicit consent record covers the irreversible effect class in the current scope. Severity: 0.7.
+
+7. **Emergency time pressure**: detected when the tool's effect profile includes `physical` AND the context metadata indicates time-critical conditions. Severity: 1.0. This trigger still invokes EAA, but the loop selects the `emergency-act` outcome with strict post-hoc accountability requirements.
+
+#### Supporting Types
+
+```typescript
+export type DutyConstraint = {
+  id: string;
+  /** What this duty protects. */
+  protects: "evidence" | "confidentiality" | "safety" | "privacy" | "oversight";
+  /** Effect classes that conflict with this duty. */
+  conflictingEffects: EffectClass[];
+  /** How critical the duty is: inviolable duties cannot be overridden by consent. */
+  criticality: "advisory" | "strong" | "inviolable";
+  description: string;
+};
+```
+
+Default duty constraints should be registered at system level (loaded from config or hardcoded for core duties like evidence preservation and confidentiality).
 
 ### 4b. EAA Adjudication Loop
 
-Create `src/consent/eaa.ts`:
+Create `src/consent/eaa.ts`.
 
-1. **Classify** action and affected parties
-2. **Discovery** -- gather minimal context needed
-3. **Evaluate** standing, risk, duties
-4. **Select** least invasive sufficient action
-5. **Outcome**: `proceed | request-consent | constrained-comply | emergency-act | refuse | escalate`
-6. **Produce artifacts**: `EAAAdjudicationResult` (formal, to binder) + `EAAReasoningRecord` (opaque, for audit)
+The EAA loop is a structured adjudication that forms the agent's commitment under uncertainty. It follows the six-step process from PDF Section V.C, with a hard separation between the reasoning (probabilistic, LLM-based) and the binding output (deterministic, structured).
 
-The adjudication result feeds into the binder as a consent anchor. The binder verifies it and mints a WO accordingly.
+#### Adjudication Steps
 
-### 4c. Integration with System Prompt
+**Step 1: Classify action and affected parties**
 
-Update `[src/agents/system-prompt.ts](src/agents/system-prompt.ts)` to include consent-bound agency instructions:
+Determine the action class (what type of effect) and who may be affected — including the requestor, named third parties, bystanders, and unknown individuals. In the current software agent context, "affected parties" are primarily message recipients, data subjects, and system operators.
 
-- Explain effect classes the agent should reason about
-- Instruct the agent to identify when effects cross boundaries
-- Provide the CO request mechanism (structured tool output)
-- Describe when to invoke EAA (slow down and deliberate)
+```typescript
+type ActionClassification = {
+  primaryEffects: EffectClass[];
+  affectedParties: AffectedParty[];
+  actionCategory: "routine" | "sensitive" | "high-risk" | "emergency";
+};
+
+type AffectedParty = {
+  role: "requestor" | "named-third-party" | "bystander" | "unknown";
+  identifier?: string;
+  affectedInterests: string[]; // e.g., "privacy", "property", "communication"
+};
+```
+
+**Step 2: Constrained discovery**
+
+Gather only the minimal evidence needed to understand duties and context. This step must NOT broaden capture or retention beyond what the active WO permits. If discovery requires effects not currently granted, it must proceed through the CO path first.
+
+Implementation: the discovery step uses the existing tool infrastructure with read-only effects. It queries the consent record store for precedents, checks standing policies, and examines the PO's request context. No LLM calls for discovery — this is deterministic context gathering.
+
+**Step 3: Evaluate standing, risk, and duties**
+
+This is where probabilistic reasoning (LLM inference) is used. The agent evaluates:
+
+- Standing confidence: is the requestor authorized for the affected interests?
+- Risk estimation: likelihood and severity of harm across alternatives
+- Duty identification: which obligations constrain action?
+- Uncertainty quantification: confidence levels for each assessment
+
+Implementation: a structured LLM call with a constrained output schema (zod-validated). The prompt provides the classification, discovery context, trigger categories, and asks for a structured risk/duty analysis. The LLM output is validated and normalized, never used as raw authority.
+
+```typescript
+type EAAEvaluation = {
+  standingAssessment: {
+    confidence: number; // 0-1
+    concerns: string[];
+  };
+  riskAssessment: {
+    likelihood: number; // 0-1
+    severity: "negligible" | "minor" | "moderate" | "serious" | "critical";
+    mitigatingFactors: string[];
+    aggravatingFactors: string[];
+  };
+  dutyAnalysis: {
+    applicableDuties: string[];
+    conflicts: Array<{ duty: string; conflictsWith: string; resolution: string }>;
+  };
+  confidenceGating: {
+    overallConfidence: number; // 0-1
+    insufficientEvidenceAreas: string[];
+  };
+};
+```
+
+**Step 4: Select least invasive sufficient action**
+
+From the evaluation, choose the minimal action set that satisfies safety and duty requirements while minimizing intrusion. This step ranks alternatives by: harm likelihood, duty violations, reversibility, and impact to affected parties.
+
+```typescript
+type ActionAlternative = {
+  description: string;
+  outcomeType: EAAOutcome;
+  effectClasses: EffectClass[];
+  constraints: WOConstraint[];
+  /** Lower is better: weighted score of harm, intrusion, and irreversibility. */
+  invasivenessScore: number;
+};
+```
+
+**Step 5: Choose an explicit outcome**
+
+Converge to one of the closed `EAAOutcome` values (already defined in `types.ts`):
+
+- `proceed` — action is justified under current consent and duties
+- `request-consent` — explicit consent is needed (triggers CO flow from Phase 3b)
+- `constrained-comply` — proceed but with additional constraints (time limits, audience restrictions, no-persistence, mandatory accountability)
+- `emergency-act` — act minimally under emergency implied consent with strict time bounds and immediate post-hoc accountability
+- `refuse` — action is not justified; explain why and what alternatives exist
+- `escalate` — route to human governance or operator review
+
+**Step 6: Produce accountability artifacts**
+
+Two artifacts, matching the PDF's specification:
+
+```typescript
+/** Authoritative input to the binder. Bounded schema only. */
+export type EAAAdjudicationResult = {
+  outcome: EAAOutcome;
+  /** Effect classes the EAA recommends for the next slice. */
+  recommendedEffects: EffectClass[];
+  /** Constraints to apply to the successor WO. */
+  recommendedConstraints: WOConstraint[];
+  /** Verifiable reference to the full reasoning record. */
+  eaaRecordRef: string;
+};
+
+/** Full reasoning bundle. Opaque to the binder. Persisted for audit. */
+export type EAAReasoningRecord = {
+  id: string;
+  /** Which triggers caused this EAA invocation. */
+  triggerCategories: EAATriggerCategory[];
+  triggerSeverity: number;
+  classification: ActionClassification;
+  discoveryContext: Record<string, unknown>;
+  evaluation: EAAEvaluation;
+  alternatives: ActionAlternative[];
+  selectedAlternative: ActionAlternative;
+  justification: string;
+  /** Evidence pointers: consent record IDs, policy IDs, tool profiles consulted. */
+  evidenceRefs: string[];
+  createdAt: number;
+};
+```
+
+#### Main Function
+
+```typescript
+export async function runElevatedActionAnalysis(params: {
+  po: PurchaseOrder;
+  activeWO: WorkOrder;
+  toolName: string;
+  toolProfile: ToolEffectProfile;
+  triggerResult: EAATriggerResult;
+  consentRecords: readonly ConsentRecord[];
+  eaaRecords: readonly EAARecord[];
+  dutyConstraints: readonly DutyConstraint[];
+  /** LLM inference function for the evaluate step. */
+  infer: EAAInferenceFn;
+}): Promise<EAARunResult>;
+
+export type EAARunResult =
+  | {
+      ok: true;
+      adjudication: EAAAdjudicationResult;
+      reasoning: EAAReasoningRecord;
+      eaaRecord: EAARecord;
+    }
+  | { ok: false; reason: string; fallbackOutcome: EAAOutcome };
+
+/** Typed inference function injected by the caller. */
+export type EAAInferenceFn = (params: {
+  classification: ActionClassification;
+  discoveryContext: Record<string, unknown>;
+  triggerCategories: EAATriggerCategory[];
+  dutyConstraints: readonly DutyConstraint[];
+}) => Promise<EAAEvaluation>;
+```
+
+#### Binder Integration
+
+After `runElevatedActionAnalysis` returns:
+
+1. Persist the `EAARecord` to the consent record store (Phase 3c)
+2. Add `EAARecord` to the scope chain via `addEAARecord()`
+3. Build a `ConsentAnchor` of kind `"eaa"` referencing the record ID
+4. The binder's `verifyConsentAnchorAgainstRecords` verifies the EAA record exists and is valid
+5. `mintSuccessorWorkOrder` uses the adjudication's `recommendedEffects` and `recommendedConstraints` as advisory inputs, resolving final grants from effect classes + registered step ceiling + policy prohibitions
+6. The binder attaches the `eaaRecordRef` as opaque metadata on the WO for audit trail
+
+#### Failure Handling
+
+- If the LLM inference call fails, EAA falls back to `refuse` with a structured explanation
+- If the evaluation returns low overall confidence (< 0.3), EAA defaults to `request-consent` (ask the user rather than guess)
+- If a duty collision is `inviolable` and cannot be resolved, EAA always returns `refuse`
+- Emergency time pressure (`emergency-act`) requires strict time-bounded WO constraints and mandatory post-hoc accountability (logged as a high-priority event)
+
+### 4c. EAA Integration into the Orchestration Pipeline
+
+Wire EAA into the existing tool verification pipeline. The decision point is in the orchestrator when `verifyToolConsent` returns `allowed: false` and the enforcement mode is `"enforce"`:
+
+```
+verifyToolConsent() → "effect-not-granted"
+    │
+    ▼
+evaluateEAATriggers()
+    │
+    ├── not triggered → requestChangeOrder() (Phase 3b CO flow)
+    │
+    └── triggered → runElevatedActionAnalysis()
+                        │
+                        ├── proceed → mintSuccessorWorkOrder() with EAA anchor → retry tool
+                        ├── request-consent → requestChangeOrder() with EAA context enrichment
+                        ├── constrained-comply → mintSuccessorWorkOrder() with additional constraints
+                        ├── emergency-act → mintSuccessorWorkOrder() with time-bounded constraints + accountability
+                        ├── refuse → return structured refusal to agent, agent must replan or explain
+                        └── escalate → emit escalation event, block tool execution pending human review
+```
+
+Create `src/consent/eaa-integration.ts` to house the orchestration wiring:
+
+```typescript
+export async function handleConsentFailure(params: {
+  toolName: string;
+  toolProfile: ToolEffectProfile;
+  missingEffects: EffectClass[];
+  po: PurchaseOrder;
+  activeWO: WorkOrder;
+  ambiguity?: AmbiguityAssessment;
+  consentRecords: readonly ConsentRecord[];
+  eaaRecords: readonly EAARecord[];
+  dutyConstraints: readonly DutyConstraint[];
+  patternStore?: ConsentPatternStore;
+  consentRecordStore?: ConsentRecordStore;
+  infer?: EAAInferenceFn;
+}): Promise<ConsentFailureResolution>;
+
+export type ConsentFailureResolution =
+  | { action: "co-requested"; changeOrder: ChangeOrder }
+  | { action: "eaa-resolved"; outcome: EAAOutcome; successorWO?: WorkOrder; explanation: string }
+  | { action: "refused"; reason: string };
+```
+
+This function:
+
+1. Checks for consent precedent reuse (Phase 3c `findConsentPrecedent`)
+2. Evaluates EAA triggers
+3. If no EAA triggered: creates a standard CO via `requestChangeOrder`
+4. If EAA triggered: runs EAA, processes the outcome, and either mints a successor WO, creates an enriched CO, or returns a refusal
+
+### 4d. Integration with System Prompt
+
+Update `[src/agents/system-prompt.ts](src/agents/system-prompt.ts)` to include consent-bound agency instructions. The system prompt additions teach the agent to participate in the consent lifecycle as a reasoning partner, not as the authority:
+
+**Effect awareness block**:
+
+- List the 10 effect classes with human-readable descriptions
+- Instruct the agent to identify which effects each step of its plan would produce
+- Explain that effects, not tool names, are the unit of consent
+
+**Consent boundary recognition**:
+
+- Instruct the agent to recognize when a planned step crosses from implied consent into territory requiring explicit consent (e.g., draft → send, read → persist, compose → disclose)
+- Provide examples of boundary crossings (from PDF Section II.A)
+
+**CO participation**:
+
+- Describe the structured tool output format for requesting a Change Order
+- Instruct the agent to frame CO requests in effect language, not tool language
+- Instruct the agent to accept CO denials gracefully and replan within the current WO
+
+**EAA awareness**:
+
+- Instruct the agent to recognize when it should "slow down and deliberate" (standing ambiguity, effect ambiguity, duty conflicts, novel tools)
+- Describe the agent's role in EAA: provide honest, grounded assessment of uncertainty and risks; do not minimize or exaggerate
+- Explain that EAA outputs are advisory to the binder, not self-granted authority
+
+**Refusal as discretion**:
+
+- Instruct the agent that refusal is a first-class outcome, not a failure
+- The agent should explain why it is refusing, what it would need to proceed, and what safer alternatives remain
 
 ---
 
@@ -406,19 +733,22 @@ Track and expose:
 
 ```mermaid
 flowchart TD
-    P0["Phase 0: Effect taxonomy + tool classification"] --> P1["Phase 1: Core contract engine (types, binder, scope chain)"]
-    P1 --> P2["Phase 2: Wire into tool execution pipeline"]
+    P0["Phase 0: Effect taxonomy + tool classification ✅"] --> P1["Phase 1: Core contract engine (types, binder, scope chain) ✅"]
+    P1 --> P2["Phase 2: Wire into tool execution pipeline ✅"]
     P2 --> P3a["Phase 3a: Implied consent derivation ✅"]
-    P3a --> P3b["Phase 3b: Change Order flow + CO description via pattern store + ambiguity detection"]
-    P3a --> P3c["Phase 3c: Consent record persistence + precedent reuse via similarity search"]
-    P3b --> P3d["Phase 3d: Revocation and withdrawal"]
+    P3a --> P3b["Phase 3b: Change Order flow + CO description + ambiguity detection ✅"]
+    P3a --> P3c["Phase 3c: Consent record persistence + precedent reuse ✅"]
+    P3b --> P3d["Phase 3d: Revocation and withdrawal ✅"]
     P3c --> P3d
-    P3d --> P4["Phase 4: EAA triggers (uses ambiguity score from 3b) + adjudication"]
-    P4 --> P5["Phase 5: Standing policies + trust tiers (pattern store reusable for policy matching)"]
+    P3d --> P4a["Phase 4a: EAA trigger detection (7 categories, uses 3b ambiguity score)"]
+    P4a --> P4b["Phase 4b: EAA adjudication loop (6-step classify→artifacts)"]
+    P4b --> P4c["Phase 4c: Pipeline integration (consent failure → EAA/CO routing)"]
+    P4c --> P4d["Phase 4d: System prompt updates (consent-aware agent behavior)"]
+    P4d --> P5["Phase 5: Standing policies + trust tiers"]
     P5 --> P6["Phase 6: Observability, receipts, metrics"]
 ```
 
-Phases 0-2 are foundational and sequential. Phase 3a (completed) provides the vector store infrastructure that 3b, 3c, and 4a build upon. Phase 3b and 3c can proceed in parallel. Phase 5 can optionally reuse the pattern store for standing policy matching.
+Phases 0-2 are foundational and sequential. Phase 3 (completed) provides the consent pattern store, change order flow, consent record persistence, and revocation machinery. Phase 4a depends on 3b's `assessRequestAmbiguity` for the effect-ambiguity trigger. Phase 4b-4c can proceed incrementally. Phase 4d (system prompt) can be done in parallel with 4b-4c since it is purely additive text. Phase 5 can optionally reuse the pattern store for standing policy matching.
 
 ---
 
@@ -435,10 +765,12 @@ Phases 0-2 are foundational and sequential. Phase 3a (completed) provides the ve
 - `implied-consent-store.ts` -- SQLite + sqlite-vec persistent pattern store ✅
 - `implied-consent-seed.ts` -- 95 curated canonical request patterns ✅
 - `implied-consent-heuristic.ts` -- 8 deterministic keyword/regex rules ✅
-- `change-order.ts` -- CO request/resolve flow (Phase 3b)
-- `consent-store.ts` -- Consent record persistence with similarity-based precedent reuse (Phase 3c)
-- `eaa.ts` -- Elevated Action Analysis engine (Phase 4)
-- `eaa-triggers.ts` -- EAA trigger detection, uses ambiguity score from pattern store (Phase 4)
+- `change-order.ts` -- CO request/resolve flow (Phase 3b) ✅
+- `consent-store.ts` -- Consent record persistence with similarity-based precedent reuse (Phase 3c) ✅
+- `revocation.ts` -- User revocation, agent withdrawal, session reset (Phase 3d) ✅
+- `eaa-triggers.ts` -- EAA trigger detection with 7 trigger categories (Phase 4a)
+- `eaa.ts` -- EAA adjudication loop: classify, discover, evaluate, select, outcome, artifacts (Phase 4b)
+- `eaa-integration.ts` -- Orchestration wiring: consent failure → EAA/CO routing (Phase 4c)
 - `policy.ts` -- Standing policies with bounding boxes (Phase 5)
 - `events.ts` -- Scope chain event model (Phase 6)
 - `remediation.ts` -- Breach containment + remediation protocol (Phase 6)
