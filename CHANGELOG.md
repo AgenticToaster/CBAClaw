@@ -3,6 +3,50 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.10.0 — 2026-04-03
+
+Phase 6a/6b/6d: Observability and Accountability — scope chain events, action receipts, and consent flow metrics.
+
+### Phase 6a: Scope Chain Event Model (`src/consent/events.ts`)
+
+- 21 typed event types covering the full consent lifecycle: WO mint/expire/supersede, CO request/grant/deny/expire/withdraw, EAA start/complete, effect execution, consent grant/revoke/withdraw, policy applied/escalated/proposed/confirmed, breach detected/contained/remediated.
+- Lightweight synchronous in-process event bus with global (`subscribeToConsentEvents`) and per-type (`subscribeToEventType`) subscriptions. Fail-safe emitter catches and logs listener exceptions without propagating into the consent pipeline.
+- 21 factory helpers (one per event type) for standardized event creation with auto-generated IDs and timestamps: `emitWOMinted`, `emitWOExpired`, `emitWOSuperseded`, `emitCORequested`, `emitCOGranted`, `emitCODenied`, `emitCOExpired`, `emitCOWithdrawn`, `emitEAAStarted`, `emitEAACompleted`, `emitEffectExecuted`, `emitConsentGranted`, `emitConsentRevoked`, `emitConsentWithdrawn`, `emitPolicyApplied`, `emitPolicyEscalated`, `emitPolicyProposed`, `emitPolicyConfirmed`, `emitBreachDetected`, `emitBreachContained`, `emitBreachRemediated`.
+- `buildEventBase`: shared base builder for consistent event ID, timestamp, PO scope, and optional agent/session context.
+- Decoupled from the gateway broadcast layer — callers bridge into gateway events (or any other transport) by subscribing a forwarding listener.
+
+### Phase 6b: Action Receipts (`src/consent/receipts.ts`)
+
+- Three detail levels for accountability artifacts:
+  - **Confirmation**: lightweight summary for routine low-risk operations under implied consent or standing policies.
+  - **Receipt**: standard audit artifact for operations requiring explicit consent (CO), policy bypass, or high-risk effects (irreversible, elevated, disclose, audience-expand, exec, physical).
+  - **Report**: full accountability artifact for operations invoking EAA, triggering breach detection, or using emergency-act authority. Includes WO chain reconstruction, EAA adjudication details, event log, and breach timeline.
+- `determineDetailLevel`: auto-selects the appropriate receipt level based on operational context (EAA invocation, breach detection, emergency act, CO resolution, policy application, high-risk effects).
+- `generateReceipt`: constructs the receipt object from the consent scope state and action results. Accepts optional `eaaAdjudications` for pre-built summaries (EAARecord lacks toolName/severity; callers with richer context should pass this).
+- `formatReceiptAsText`: human-readable textual representation with level-appropriate detail sections (actions, consent chain, constraints, errors, COs, policies, EAA adjudications, WO chain, breach status).
+
+### Phase 6d: Consent Flow Metrics (`src/consent/metrics.ts`)
+
+- In-process counters and histograms for 25 consent flow KPIs: WO minted/expired/superseded, CO requested/granted/denied/expired/withdrawn, EAA started/completed/duration, effect executed/failed, consent granted/revoked/withdrawn, policy applied/escalated/proposed/confirmed, verification failures, policy bypasses, breach detected/contained/remediated.
+- Per-effect CO tracking: requested/granted/denied counts broken down by effect class.
+- EAA outcome distribution tracking (proceed/refuse/constrained-comply/escalate/defer).
+- Configurable histogram buckets for EAA duration measurement (default: 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000 ms).
+- `startMetricsCollection`: auto-populates metrics by subscribing to the consent event bus. Safe to call multiple times; subsequent calls replace the previous subscription.
+- `getMetricsSnapshot`: JSON-serializable point-in-time snapshot for bridging to external observability backends.
+
+### Phase 6a/6b/6d: Barrel Exports (`src/consent/index.ts`)
+
+- Phase 6a: All 21 event types, `ConsentEvent` union, `ConsentEventBase`, listener types, `subscribeToConsentEvents`, `subscribeToEventType`, `emitConsentEvent`, `buildEventBase`, all 21 factory helpers.
+- Phase 6b: `ActionReceiptBase`, `ConfirmationReceipt`, `ActionReceipt`, `ActionReport`, `AnyReceipt`, `ReceiptDetailLevel`, `ReceiptError`, `ActionSummaryEntry`, `ConsentChainEntry`, `ChangeOrderSummary`, `PolicySummary`, `EAAAdjudicationSummary`, `WOChainEntry`, `DetermineDetailLevelParams`, `GenerateReceiptParams`, `determineDetailLevel`, `generateReceipt`, `formatReceiptAsText`.
+- Phase 6d: `MetricCounter`, `MetricHistogram`, `HistogramBucket`, `MetricsSnapshot`, `METRIC_NAMES`, `incrementCounter`, `recordHistogramValue`, `recordCOByEffect`, `recordEAAOutcome`, `recordVerificationFailure`, `recordPolicyBypass`, `getMetricsSnapshot`, `startMetricsCollection`, `resetMetrics`.
+
+### Phase 6a/6b/6d: Tests
+
+- `src/consent/events.test.ts`: 34 tests — global listener registration/invocation/unsubscription, typed listener filtering/unsubscription/cleanup, error isolation (global + typed), dual dispatch (global + typed receive same event), buildEventBase (required fields, optional fields), all 21 factory helpers (emitWOMinted with/without predecessor, emitWOSuperseded, emitWOExpired, emitCORequested, emitCOGranted, emitCODenied, emitCOExpired, emitCOWithdrawn, emitEAAStarted, emitEAACompleted, emitEffectExecuted, emitConsentGranted, emitConsentRevoked, emitConsentWithdrawn, emitPolicyApplied, emitPolicyEscalated, emitPolicyProposed, emitPolicyConfirmed, emitBreachDetected, emitBreachContained, emitBreachRemediated), testing seam clearAll.
+- `src/consent/receipts.test.ts`: 28 tests — determineDetailLevel (breach/emergency/EAA → report, CO/policy/high-risk → receipt, routine/persist/empty → confirmation, priority ordering), generateReceipt (confirmation, receipt with CO, report with EAA, report with breach, errors, overrideLevel, effect deduplication, WO chain, applied policies, pre-built eaaAdjudications override), formatReceiptAsText (confirmation/receipt/report formatting, breach display, consent violations, failed actions), internal helpers (deduplicateEffects, buildConsentChain anchor mapping, buildWOChain).
+- `src/consent/metrics.test.ts`: 24 tests — incrementCounter (creation, accumulation, default amount), recordHistogramValue (statistics, cumulative buckets, empty), recordCOByEffect (per-effect tracking, accumulation), recordEAAOutcome (distribution), recordVerificationFailure, recordPolicyBypass, getMetricsSnapshot (complete snapshot, zero-safe histogram, empty snapshot), resetMetrics (clears all), startMetricsCollection auto-collection (wo.minted, co.requested per-effect, co.granted per-effect, eaa.completed with outcome+duration, effect.executed success/failure, breach events, policy events, unsubscribe stops collection, subsequent calls replace subscription), METRIC_NAMES constants.
+- **Full Phase 6 test count: 86 passing.**
+
 ## 0.9.0 — 2026-04-02
 
 Phase 5c–5i: Binder dual-path policy evaluation, default system policies, self-minted policy proposals, dynamic trust tiers, configuration surface, and pipeline integration.
