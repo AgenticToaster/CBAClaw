@@ -120,6 +120,63 @@ async function requireRiskAcknowledgement(params: {
   }
 }
 
+async function promptConsentBoundAgencyConfig(
+  config: OpenClawConfig,
+  prompter: WizardPrompter,
+): Promise<OpenClawConfig> {
+  const currentEnabled = config.consent?.policies?.enabled === true;
+  const enableCba = await prompter.confirm({
+    message: "Enable Consent-Bound Agency (CBA) enforcement?",
+    initialValue: currentEnabled,
+  });
+  if (!enableCba) {
+    return config;
+  }
+
+  const enforcementMode = await prompter.select({
+    message: "CBA enforcement mode",
+    options: [
+      {
+        value: "log",
+        label: "Log only",
+        hint: "Consent failures logged at debug level (safe rollout)",
+      },
+      { value: "warn", label: "Warn", hint: "Consent failures logged at warn level" },
+      { value: "enforce", label: "Enforce", hint: "Consent failures block tool execution" },
+    ],
+    initialValue: "log" as string,
+  });
+
+  const enablePolicies = await prompter.confirm({
+    message: "Enable standing policies (persistent consent patterns)?",
+    initialValue: currentEnabled,
+  });
+
+  await prompter.note(
+    [
+      `Enforcement mode: ${enforcementMode}`,
+      `Standing policies: ${enablePolicies ? "enabled" : "disabled"}`,
+      "",
+      `Set CBA_ENFORCEMENT=${enforcementMode} in your environment.`,
+      enablePolicies
+        ? "Policy store will be created at ~/.openclaw/consent/policies.sqlite."
+        : "Policies disabled; consent uses implied + explicit grants only.",
+    ].join("\n"),
+    "Consent-Bound Agency",
+  );
+
+  return {
+    ...config,
+    consent: {
+      ...config.consent,
+      policies: {
+        ...config.consent?.policies,
+        enabled: enablePolicies,
+      },
+    },
+  };
+}
+
 export async function runSetupWizard(
   opts: OnboardOptions,
   runtime: RuntimeEnv = defaultRuntime,
@@ -626,6 +683,12 @@ export async function runSetupWizard(
   // Setup hooks (session memory on /new)
   const { setupInternalHooks } = await import("../commands/onboard-hooks.js");
   nextConfig = await setupInternalHooks(nextConfig, runtime, prompter);
+
+  // Consent-Bound Agency (CBA) — opt-in for enforcement + standing policies.
+  // Only shown in advanced flow; quickstart skips this (defaults are safe).
+  if (flow === "advanced") {
+    nextConfig = await promptConsentBoundAgencyConfig(nextConfig, prompter);
+  }
 
   nextConfig = onboardHelpers.applyWizardMetadata(nextConfig, { command: "onboard", mode });
   await writeConfigFile(nextConfig);

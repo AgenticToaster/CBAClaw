@@ -702,6 +702,7 @@ export async function runEmbeddedAttempt(
       reactionGuidance,
       promptMode: effectivePromptMode,
       acpEnabled: params.config?.acp?.enabled !== false,
+      cbaEnabled: consentCtx !== undefined,
       runtimeInfo,
       messageToolHints,
       sandboxInfo,

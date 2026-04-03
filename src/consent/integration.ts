@@ -16,6 +16,7 @@ import { randomUUID } from "node:crypto";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { configureSigningKey, mintInitialWorkOrder, verifyToolAgainstWO } from "./binder.js";
 import { getToolEffectProfile } from "./effect-registry.js";
+import { startMetricsCollection } from "./metrics.js";
 import type { PolicyStore } from "./policy-store.js";
 import { DEFAULT_SYSTEM_POLICIES } from "./policy.js";
 import type { StandingPolicy } from "./policy.js";
@@ -168,7 +169,7 @@ export type ConsentRunContext = {
 export async function initializeConsentForRun(
   params: CreatePurchaseOrderParams & {
     env?: NodeJS.ProcessEnv;
-    /** Pre-opened policy store (Phase 5i). Omit to skip policy loading. */
+    /** Pre-opened policy store (Phase 5i). Omit to auto-open from config. */
     policyStore?: PolicyStore;
   },
 ): Promise<ConsentRunContext | undefined> {
@@ -177,6 +178,9 @@ export async function initializeConsentForRun(
 
   // Phase 3a: derive implied effects from request text unless explicitly set
   let impliedEffects = params.impliedEffects;
+  let consentPoliciesConfig:
+    | { enabled?: boolean; storePath?: string; embeddingDimension?: number }
+    | undefined;
   if (!impliedEffects) {
     try {
       const { deriveImpliedEffects } = await import("./implied-consent.js");
@@ -185,6 +189,7 @@ export async function initializeConsentForRun(
         const { loadConfig } = await import("../config/config.js");
         const cfg = loadConfig();
         consentConfig = cfg.consent?.impliedEffects as Record<string, unknown> | undefined;
+        consentPoliciesConfig = cfg.consent?.policies;
       } catch {
         // Config unavailable during bootstrap; proceed with defaults
       }
@@ -199,18 +204,36 @@ export async function initializeConsentForRun(
     }
   }
 
+  // Phase 5i: auto-open policy store from config when policies are enabled
+  // and no pre-opened store was provided.
+  let policyStore = params.policyStore;
+  if (!policyStore && consentPoliciesConfig?.enabled) {
+    try {
+      const { openPolicyStore, resolveDefaultPolicyStorePath, resolvePolicyStorePath } =
+        await import("./policy-store.js");
+      const dbPath = consentPoliciesConfig.storePath
+        ? resolvePolicyStorePath(consentPoliciesConfig.storePath)
+        : await resolveDefaultPolicyStorePath();
+      policyStore = await openPolicyStore({
+        dbPath,
+        embeddingDimension: consentPoliciesConfig.embeddingDimension ?? 0,
+      });
+      log.debug(`policy store opened from config: ${dbPath}`);
+    } catch (err) {
+      log.warn(`failed to open policy store from config: ${String(err)}`);
+    }
+  }
+
   // Phase 5i: load active policies from store, expire stale ones.
-  // Only load system + user policies when a policy store is provided,
-  // preserving backward compatibility for existing callers.
   let allPolicies: BinderPolicy[] = [];
   let activePolicies: StandingPolicy[] = [];
-  if (params.policyStore) {
+  if (policyStore) {
     try {
-      const expired = params.policyStore.expireStalePolicies();
+      const expired = policyStore.expireStalePolicies();
       if (expired > 0) {
         log.debug(`expired ${expired} stale policies during initialization`);
       }
-      activePolicies = params.policyStore.getActivePolicies();
+      activePolicies = policyStore.getActivePolicies();
       log.debug(`loaded ${activePolicies.length} active policies from store`);
       allPolicies = [...DEFAULT_SYSTEM_POLICIES, ...activePolicies];
     } catch (err) {
@@ -236,6 +259,9 @@ export async function initializeConsentForRun(
 
   const scopeState = createInitialConsentScopeState(po, result.wo);
 
+  // Phase 6d: start metrics collection on first successful initialization
+  startMetricsCollection();
+
   log.debug(
     `consent scope initialized: po=${po.id} wo=${result.wo.id} ` +
       `effects=[${result.wo.grantedEffects.join(",")}] enforcement=${enforcement}`,
@@ -247,7 +273,7 @@ export async function initializeConsentForRun(
     wo: result.wo,
     enforcement,
     activePolicies: allPolicies,
-    policyStore: params.policyStore,
+    policyStore,
   };
 }
 

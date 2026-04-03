@@ -1,5 +1,13 @@
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
+import { handleConsentFailure } from "../consent/eaa-integration.js";
+import { DEFAULT_DUTY_CONSTRAINTS } from "../consent/eaa-triggers.js";
 import { verifyToolConsent } from "../consent/integration.js";
+import {
+  getActivePurchaseOrder,
+  getActiveWorkOrder,
+  getConsentRecords,
+  getEAARecords,
+} from "../consent/scope-chain.js";
 import type { SessionState } from "../logging/diagnostic-session-state.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
@@ -382,7 +390,39 @@ export function wrapToolWithBeforeToolCallHook(
       // from CBA_ENFORCEMENT env var; defaults to "log" for safe rollout.
       const consentOutcome = verifyToolConsent(toolName, toolEffectProfile);
       if (!consentOutcome.allowed) {
-        throw new Error(consentOutcome.reason);
+        const po = getActivePurchaseOrder();
+        const activeWO = getActiveWorkOrder();
+        if (po && activeWO) {
+          const profile = toolEffectProfile ?? { effects: [], trustTier: "external" as const };
+          const verificationResult = consentOutcome.result;
+          const missingEffects = !verificationResult.ok ? verificationResult.missingEffects : [];
+          const resolution = await handleConsentFailure({
+            toolName,
+            toolProfile: profile,
+            missingEffects,
+            po,
+            activeWO,
+            consentRecords: getConsentRecords() ?? [],
+            eaaRecords: getEAARecords() ?? [],
+            dutyConstraints: DEFAULT_DUTY_CONSTRAINTS,
+          });
+          if (resolution.action === "eaa-resolved" && resolution.successorWO) {
+            // Scope transitioned by handleConsentFailure; proceed with tool
+          } else if (resolution.action === "co-requested") {
+            throw new Error(
+              `Consent required: a Change Order has been created for effects ` +
+                `[${missingEffects.join(", ")}]. Awaiting approval.`,
+            );
+          } else {
+            const reason =
+              resolution.action === "refused"
+                ? resolution.reason
+                : (resolution.explanation ?? consentOutcome.reason);
+            throw new Error(reason);
+          }
+        } else {
+          throw new Error(consentOutcome.reason);
+        }
       }
 
       const outcome = await runBeforeToolCallHook({
