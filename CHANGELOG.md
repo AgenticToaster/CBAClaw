@@ -3,6 +3,48 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.8.0 — 2026-04-02
+
+Phase 5a/5b: Standing policy type system, persistence store with vector similarity.
+
+### Phase 5a: Standing Policy Type System (`src/consent/policy.ts`)
+
+- `StandingPolicy`: full standing policy type with bounding-box semantics — `effectScope`, `applicability`, `escalationRules`, `expiry`, `revocationSemantics`, `provenance`, `description`, and `status`. Replaces `StandingPolicyStub` when the policy framework is active.
+- `PolicyApplicabilityPredicate`: optional filters for channels, chat types, sender IDs, owner requirement, time window (with overnight wrap), tool names, and minimum trust tier. Empty predicate matches universally.
+- `EscalationRule` + `EscalationCondition`: discriminated union of conditions (`effect-combination`, `audience-exceeds`, `frequency-exceeds`, `trust-tier-below`, `custom`) that force CO/EAA/refusal even when a policy would grant consent.
+- `PolicyExpiry`: time-based (`expiresAt`) and usage-based (`maxUses`) expiry with `currentUses` tracking.
+- `PolicyProvenance`: audit trail (author, createdAt, confirmedAt, sourceRef).
+- `PolicyMatchContext`: runtime context for applicability matching (channel, chatType, senderId, senderIsOwner, toolName, toolTrustTier, currentHour).
+- Three policy classes: `system` (inviolable, hardcoded), `user` (operator-created), `self-minted` (agent-proposed, requires confirmation).
+- `filterApplicablePolicies`: filters a policy list to active, non-expired policies matching a given context. Handles both `StandingPolicy` and `StandingPolicyStub` inputs (stubs silently skipped).
+- `evaluateEscalationRules`: evaluates escalation conditions against tool context. Returns first matching rule or undefined.
+- `isExpired`: checks both time-based and usage-based expiry.
+- `meetsTrustTier`: ordered trust tier comparison (external < sandboxed < in-process).
+- `isFullStandingPolicy`: type guard discriminating `StandingPolicy` from `StandingPolicyStub`.
+- `DEFAULT_SYSTEM_POLICIES`: 3 hardcoded system policies — read/compose baseline (always permitted), physical-requires-EAA (always escalates), elevated-owner-only (restricted to owner + in-process).
+- `buildPolicyEmbeddingText`: builds composite embedding text from policy effect scope and description (`[effects: read, persist] Allow file operations`).
+- `buildContextEmbeddingText`: builds matching query embedding text from runtime context (effects, tool name, description).
+
+### Phase 5b: Policy Store — Persistence + Vector Similarity (`src/consent/policy-store.ts`)
+
+- Persistent agent-global SQLite + sqlite-vec store for standing policies at `~/.openclaw/consent/policies.sqlite`. Unlike consent records (per-session), policies persist across sessions.
+- Schema: `policies` table (id, class, effect_scope, applicability, escalation_rules, expiry, revocation_semantics, provenance, description, status, created_at, updated_at) with CHECK constraints on class/revocation_semantics/status, indexes on status and class. `policy_usage` table for per-WO usage tracking (composite PK for deduplication). `policy_embeddings` vec0 virtual table for cosine KNN search (conditionally created when embeddingDimension > 0).
+- Full CRUD: `insertPolicy`, `getPolicy`, `getActivePolicies`, `getActivePoliciesByClass`.
+- Status lifecycle: `updatePolicyStatus`, `confirmPolicy` (atomic status + provenance update in a transaction for pending-confirmation → active).
+- Usage tracking: `recordPolicyUsage` (deduplicated by policy+WO pair), `getPolicyUsageCount`. `currentUses` hydrated from usage table on read (source of truth is the usage table, not the expiry JSON).
+- Expiry sweep: `expireStalePolicies` — scans active policies and expires those past `expiresAt` or exceeding `maxUses`.
+- Embedding operations: `upsertPolicyEmbedding`, `deletePolicyEmbedding`, `findSimilarPolicies` (KNN with cosine distance, configurable topK/threshold/statusFilter). All are no-ops when embeddingDimension is 0 (backward compatible).
+- Serialization: `EscalationCondition` with `kind: "custom"` carries a function-typed `evaluate` field that is stripped on write. Custom conditions are runtime-only and must be restored from the system policy registry on read.
+- `openPolicyStore`: async factory with schema creation, optional sqlite-vec loading, WAL journaling, foreign keys.
+- Path resolution: `resolvePolicyStorePath`, `resolveDefaultPolicyStorePath`.
+
+### Phase 5a/5b: Tests
+
+- `src/consent/policy.test.ts`: 103 tests — trust tier ordering, type guard (full policy, stub, partial objects), applicability matching (universal, channel, chatType, senderId, requireOwner, timeWindow with overnight wrap, toolNames, minTrustTier, multiple filters), expiry (time-based, usage-based, both, zero maxUses, no limits), escalation rules (effect-combination, audience-exceeds, frequency-exceeds, trust-tier-below, custom, no match, empty effects), filterApplicablePolicies (active/inactive/revoked/expired filtering, applicability, mixed stubs+policies, empty input, maxUses expiry), default system policies (count, read-compose baseline, physical-EAA escalation, elevated-owner restriction), embedding text builders (policy text with/without effects, context text with effects/tool/description/combinations, empty inputs).
+- `src/consent/policy-store.test.ts`: 35 tests — basic CRUD (insert, retrieve, non-existent, duplicate insert PK constraint), serialization round-trips (applicability, provenance, expiry with currentUses hydration, revocationSemantics), escalation rule serialization (standard conditions, custom condition stripping), active policy queries (status filtering, class filtering), status updates (update, non-existent, custom timestamp), policy confirmation (pending → active with confirmedAt, non-existent, already active, revoked), usage tracking (record/count, deduplication, currentUses hydration), expiry sweep (time-based, maxUses, no stale, custom timestamp), embedding no-ops at dim=0 (upsert, delete, findSimilar), clearAll, multi-class coexistence, edge cases (empty effectScope/applicability/escalationRules, all effect classes, idempotent close).
+
+---
+
 ## 0.7.0 — 2026-04-02
 
 Phase 4c/4d: EAA orchestration integration and system prompt consent instructions.

@@ -178,3 +178,36 @@ export type {
   RiskSeverity,
 } from "./eaa.js";
 export { runElevatedActionAnalysis } from "./eaa.js";
+
+// Phase 5a: Standing Policy Type System
+export type {
+  EscalationCondition,
+  EscalationContext,
+  EscalationRule,
+  PolicyApplicabilityPredicate,
+  PolicyClass,
+  PolicyExpiry,
+  PolicyMatchContext,
+  PolicyProvenance,
+  PolicyRevocationSemantics,
+  PolicyStatus,
+  StandingPolicy,
+} from "./policy.js";
+export {
+  buildContextEmbeddingText,
+  buildPolicyEmbeddingText,
+  DEFAULT_SYSTEM_POLICIES,
+  evaluateEscalationRules,
+  filterApplicablePolicies,
+  isExpired,
+  isFullStandingPolicy,
+  meetsTrustTier,
+} from "./policy.js";
+
+// Phase 5b: Policy Store (Persistence + Vector Similarity)
+export type { OpenPolicyStoreParams, PolicyStore } from "./policy-store.js";
+export {
+  openPolicyStore,
+  resolveDefaultPolicyStorePath,
+  resolvePolicyStorePath,
+} from "./policy-store.js";

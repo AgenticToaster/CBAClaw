@@ -37,27 +37,27 @@ todos:
     status: completed
   - id: phase-5a-types
     content: "Standing policy type system: StandingPolicy, PolicyApplicabilityPredicate, EscalationRule, PolicyExpiry, PolicyProvenance, PolicyStatus, type guard isFullStandingPolicy, backward compat with StandingPolicyStub"
-    status: pending
+    status: completed
   - id: phase-5b-store
-    content: "Policy persistence: SQLite policy store (agent-global, not per-session), policies + policy_usage tables, CRUD interface, usage tracking, expiry sweep, embedding support via sqlite-vec"
-    status: pending
+    content: "Policy persistence + vector similarity: SQLite + sqlite-vec policy store (agent-global, not per-session), policies + policy_usage + policy_embeddings vec0 tables, CRUD interface, usage tracking, expiry sweep, upsertPolicyEmbedding/deletePolicyEmbedding/findSimilarPolicies for semantic retrieval (absorbed Phase 5g)"
+    status: completed
   - id: phase-5c-binder
-    content: "Binder policy evaluation: policy application order (system → user → self-minted), applicability predicate matching, escalation rule evaluation, policy anchor verification in verifyConsentAnchorAgainstRecords, augmented mintInitialWorkOrder"
+    content: "Binder policy evaluation with dual-path retrieval: deterministic path (filterApplicablePolicies) + semantic path (embed context → findSimilarPolicies → validate candidates), PolicyEmbedder type, merge/dedup by policy id, policy application order (system → user → self-minted), escalation rule evaluation, policy anchor verification, backward compat when embeddings disabled"
     status: pending
   - id: phase-5d-defaults
     content: "Default system policies: read/compose baseline, physical-EAA escalation, elevated-owner restriction. Loaded at startup alongside DEFAULT_DUTY_CONSTRAINTS."
     status: pending
   - id: phase-5e-proposal
-    content: "Self-minted policy proposal: consent record pattern analysis, repetition detection, high-risk safety constraints, pending-confirmation lifecycle, user confirmation prompt"
+    content: "Self-minted policy proposal with semantic conflict detection: consent record pattern analysis, repetition detection, high-risk safety constraints, pending-confirmation lifecycle, user confirmation prompt, semantic overlap check via findSimilarPolicies before proposing, CO-to-policy promotion via checkCOForPolicyPromotion"
     status: pending
   - id: phase-5f-trust
     content: "Dynamic trust tiers for plugin tools: manifest declaration, derived tier from plugin source (bundled/npm/MCP), trust-tier impact on policy acceptance and EAA thresholds"
     status: pending
   - id: phase-5g-pattern
-    content: "Pattern store reuse for policy matching: policy embedding, semantic search for policy discovery, conflict detection, CO-to-policy promotion"
-    status: pending
+    content: "ABSORBED into Phases 5b/5c/5e: policy embedding, semantic search, conflict detection, and CO-to-policy promotion are now first-class capabilities in the policy store (5b), binder dual-path retrieval (5c), and proposal flow (5e)"
+    status: cancelled
   - id: phase-5h-config
-    content: "Configuration surface: consent.policies config section (enabled, storePath, selfMintedMaxExpiryMs, selfMintedMinRepetitions, enableEmbeddings), Zod schema, config baseline regeneration"
+    content: "Configuration surface: consent.policies config section (enabled, storePath, selfMintedMaxExpiryMs, selfMintedMinRepetitions, embeddingDimension), Zod schema, config baseline regeneration"
     status: pending
   - id: phase-5i-integration
     content: "Pipeline integration: policy-loaded initializeConsentForRun, policy bypass in handleConsentFailure, policies passed to mintSuccessorWithAnchor, index.ts barrel update"
@@ -787,9 +787,9 @@ export function isFullStandingPolicy(p: StandingPolicyStub | StandingPolicy): p 
 }
 ```
 
-### 5b. Policy Store (Persistence)
+### 5b. Policy Store (Persistence + Vector Similarity)
 
-Create `src/consent/policy-store.ts`. Policies persist across sessions (unlike consent records which are per-session).
+Create `src/consent/policy-store.ts`. Policies persist across sessions (unlike consent records which are per-session). The store integrates `sqlite-vec` from day one for embedding-based semantic policy retrieval, following the same dual-storage pattern established by `consent-store.ts` (Phase 3c) and `implied-consent-store.ts` (Phase 3a).
 
 #### Storage Location
 
@@ -832,6 +832,17 @@ CREATE TABLE policy_usage (
 CREATE INDEX idx_policy_usage_policy ON policy_usage(policy_id);
 ```
 
+**`policy_embeddings`** vec0 virtual table (semantic similarity search):
+
+```sql
+CREATE VIRTUAL TABLE IF NOT EXISTS policy_embeddings USING vec0(
+  policy_id TEXT PRIMARY KEY,
+  embedding float[<dim>] distance_metric=cosine
+);
+```
+
+The embedding dimension is set at store creation time via `OpenPolicyStoreParams.embeddingDimension`. When `embeddingDimension` is 0 or omitted, the vec0 table is not created and embedding methods are no-ops (backward compatible).
+
 #### Store Interface
 
 ```typescript
@@ -854,28 +865,83 @@ export type PolicyStore = {
   getPolicyUsageCount(policyId: string): number;
   /** Expire policies that have exceeded their expiresAt or maxUses. */
   expireStalePolices(now?: number): number;
+
+  // --- Embedding / Similarity (from absorbed Phase 5g) ---
+
+  /** Store/update an embedding for a policy's composite description text. */
+  upsertPolicyEmbedding(policyId: string, embedding: Float32Array): void;
+  /** Delete embedding when a policy is revoked/expired. */
+  deletePolicyEmbedding(policyId: string): void;
+  /**
+   * KNN similarity search against policy embeddings.
+   * Returns candidates ordered by cosine distance, filtered by threshold.
+   * Only returns policies with status in statusFilter (default: ["active"]).
+   */
+  findSimilarPolicies(params: {
+    embedding: Float32Array;
+    topK?: number;
+    threshold?: number;
+    statusFilter?: PolicyStatus[];
+  }): Array<{ policy: StandingPolicy; distance: number }>;
+
   /** Remove all policies (for testing). */
   clearAll(): void;
   /** Close the database connection. */
   close(): void;
+  /** Exposed for testing. */
+  readonly db: DatabaseSync;
 };
 
 export type OpenPolicyStoreParams = {
+  /** Full path to the SQLite database file. */
   dbPath: string;
-  injectedDb?: unknown;
+  /** Embedding dimension for the vec0 virtual table. 0 or undefined = embeddings disabled. */
+  embeddingDimension?: number;
+  /** Pre-opened DatabaseSync instance (for testing). */
+  injectedDb?: DatabaseSync;
+  /** Skip sqlite-vec loading (for testing or when embeddings not needed). */
+  skipVecExtension?: boolean;
 };
 
-export function openPolicyStore(params: OpenPolicyStoreParams): PolicyStore;
+export async function openPolicyStore(params: OpenPolicyStoreParams): Promise<PolicyStore>;
 export function resolveDefaultPolicyStorePath(): Promise<string>;
 ```
+
+#### Embedding Text Construction
+
+Each policy is embedded as a composite text built by `buildPolicyEmbeddingText()` in `policy.ts`:
+
+```
+"[effects: read, persist] Allow file read and write operations for the notes tool during work hours"
+```
+
+Format: `[effects: <effectScope joined>] <description>`. This gives the embedding vector both semantic intent and effect scope signal. Query-side context is built by `buildContextEmbeddingText()`:
+
+```
+"[effects: read, persist] Save user notes to disk using notes-tool"
+```
+
+The store is decoupled from the embedding provider: callers are responsible for generating the `Float32Array` embedding and calling `upsertPolicyEmbedding` separately (same pattern as `consent-store.ts` `upsertConsentEmbedding`).
 
 #### Serialization
 
 `EscalationCondition` with `kind: "custom"` includes a function-typed `evaluate` field. This is NOT persisted to SQLite. Custom escalation conditions are runtime-only and must be registered via code (system policies). Serialization strips `custom` conditions on write and restores them from the system policy registry on read.
 
-### 5c. Policy Evaluation in the Binder
+### 5c. Policy Evaluation in the Binder (Dual-Path Retrieval)
 
 Modify `src/consent/binder.ts` to evaluate standing policies during WO minting. This is the core integration point.
+
+The binder uses **dual-path policy retrieval**: a deterministic path (exact predicate matching via `filterApplicablePolicies`) and an optional semantic path (embedding similarity via the policy store's `findSimilarPolicies`). The deterministic path is the safety backbone; the semantic path adds recall for policies whose descriptions are semantically relevant to the current operation. All semantic candidates must still pass the full deterministic validation gauntlet (applicability, expiry, escalation) before becoming consent anchors.
+
+#### PolicyEmbedder Type
+
+The binder accepts an optional embedding function for the semantic path:
+
+```typescript
+export type PolicyEmbedder = (text: string) => Promise<Float32Array>;
+```
+
+When no `PolicyEmbedder` or no `PolicyStore` with embeddings is provided, the binder falls back to deterministic-only retrieval (backward compatible with Phases 0-4).
 
 #### Policy Application Order (Precedence)
 
@@ -903,11 +969,8 @@ export function mintInitialWorkOrder(input: BinderMintInput): BinderResult {
   );
   for (const sp of systemPolicies) {
     if (isFullStandingPolicy(sp)) {
-      // System policies that restrict: add their scoped effects to prohibited set
-      // when the policy has escalation rules that refuse
       for (const rule of sp.escalationRules) {
         if (rule.action === "refuse") {
-          // This policy explicitly prohibits certain effect combinations
           // handled at evaluation time, not here
         }
       }
@@ -917,26 +980,60 @@ export function mintInitialWorkOrder(input: BinderMintInput): BinderResult {
   // Derive grants from implied effects, minus prohibited
   const implied = po.impliedEffects.filter((e) => !prohibited.has(e));
 
-  // Phase 5: augment with policy-granted effects
+  // Phase 5: augment with policy-granted effects via dual-path retrieval
   const policyAnchors: ConsentAnchor[] = [];
   const policyGrantedEffects: EffectClass[] = [];
 
-  const applicablePolicies = filterApplicablePolicies(policies, {
+  const matchContext: PolicyMatchContext = {
     channel: po.channel,
     chatType: po.chatType,
     senderId: po.senderId,
     senderIsOwner: po.senderIsOwner,
-  });
+  };
 
-  for (const policy of applicablePolicies) {
+  // --- Deterministic path (always runs) ---
+  const deterministicPolicies = filterApplicablePolicies(policies, matchContext);
+
+  // --- Semantic path (optional, when embedder + policyStore available) ---
+  let semanticPolicies: StandingPolicy[] = [];
+  if (policyEmbedder && policyStore) {
+    const contextText = buildContextEmbeddingText({
+      effects: po.impliedEffects,
+      description: po.requestDescription,
+    });
+    const embedding = await policyEmbedder(contextText);
+    const candidates = policyStore.findSimilarPolicies({
+      embedding,
+      topK: 5,
+      threshold: 0.3,
+    });
+    // Validate each semantic candidate through the deterministic gauntlet
+    for (const { policy } of candidates) {
+      if (policy.status !== "active") continue;
+      if (isExpired(policy.expiry)) continue;
+      if (!matchesApplicability(policy.applicability, matchContext)) continue;
+      semanticPolicies.push(policy);
+    }
+  }
+
+  // --- Merge: union of deterministic + validated semantic, dedup by id ---
+  const seenIds = new Set<string>();
+  const mergedPolicies: StandingPolicy[] = [];
+  for (const p of [...deterministicPolicies, ...semanticPolicies]) {
+    if (!seenIds.has(p.id)) {
+      seenIds.add(p.id);
+      mergedPolicies.push(p);
+    }
+  }
+
+  for (const policy of mergedPolicies) {
     if (!isFullStandingPolicy(policy)) continue;
     if (policy.class === "system") continue; // system handled above
     if (policy.status !== "active") continue;
     if (isExpired(policy.expiry)) continue;
 
-    // Check escalation rules before granting
     const escalated = evaluateEscalationRules(policy.escalationRules /* context */);
-    if (escalated) continue; // skip this policy; escalation handler will deal with it
+    if (escalated) continue;
 
     for (const effect of policy.effectScope) {
       if (!prohibited.has(effect) && !implied.includes(effect)) {
@@ -1016,6 +1113,16 @@ export function recordAndCheckUsage(
   woId: string,
   store: PolicyStore,
 ): boolean;
+
+/** Build composite text for embedding a policy's description + effect scope. */
+export function buildPolicyEmbeddingText(policy: StandingPolicy): string;
+
+/** Build composite text for embedding a query context (effects + description). */
+export function buildContextEmbeddingText(params: {
+  effects: EffectClass[];
+  toolName?: string;
+  description?: string;
+}): string;
 ```
 
 ### 5d. Default System Policies
@@ -1076,15 +1183,19 @@ export const DEFAULT_SYSTEM_POLICIES: readonly StandingPolicy[] = [
 ];
 ```
 
-### 5e. Self-Minted Policy Proposal
+### 5e. Self-Minted Policy Proposal (with Semantic Conflict Detection)
 
-When the agent detects repeated consent patterns (same effects being CO-granted across multiple requests), it can propose a standing policy. This leverages the consent record store's precedent search from Phase 3c.
+When the agent detects repeated consent patterns (same effects being CO-granted across multiple requests), it can propose a standing policy. This leverages both the consent record store's precedent search from Phase 3c and the policy store's vector similarity search (Phase 5b) for conflict detection and CO-to-policy promotion.
 
 Create `src/consent/policy-proposal.ts`:
 
 ```typescript
 export type PolicyProposalParams = {
   consentRecordStore: ConsentRecordStore;
+  /** Policy store with embedding support for conflict detection. */
+  policyStore: PolicyStore;
+  /** Embedder for generating policy description embeddings. */
+  embedder?: PolicyEmbedder;
   /** Minimum number of times the same effect set must be granted before proposal. */
   minRepetitions: number;
   /** Time window to look back for repeated grants. */
@@ -1100,28 +1211,60 @@ export type PolicyProposal = {
   evidenceRecordIds: string[];
   /** Human-readable rationale for the user. */
   rationale: string;
+  /** Existing policies that semantically overlap (conflict detection). */
+  overlappingPolicies: Array<{ policy: StandingPolicy; distance: number }>;
 };
 
 /**
  * Analyze recent consent records for repeated grant patterns that suggest
  * a standing policy would reduce friction without compromising safety.
  *
+ * Uses semantic conflict detection: before proposing, embeds the candidate
+ * policy description and runs findSimilarPolicies against the existing
+ * policy store. Overlapping policies are surfaced in the proposal rather
+ * than silently creating duplicates.
+ *
  * Only proposes policies for non-high-risk effect sets. Never proposes
  * policies that would cover irreversible, physical, or elevated effects
  * without explicit escalation rules.
  */
-export function analyzeForPolicyProposals(params: PolicyProposalParams): PolicyProposal[];
+export function analyzeForPolicyProposals(params: PolicyProposalParams): Promise<PolicyProposal[]>;
 
 /**
  * Convert a policy proposal to a pending self-minted StandingPolicy.
  * The policy is created with status "pending-confirmation" and requires
  * user confirmation via confirmPolicy() before it can be used as a
- * consent anchor.
+ * consent anchor. If an embedder is available, the policy's embedding
+ * is stored alongside it.
  */
 export function createSelfMintedPolicy(
   proposal: PolicyProposal,
   store: PolicyStore,
-): StandingPolicy;
+  embedder?: PolicyEmbedder,
+): Promise<StandingPolicy>;
+```
+
+#### CO-to-Policy Promotion
+
+When a CO is granted for effects that a standing policy could cover, the system suggests policy creation:
+
+```typescript
+/**
+ * Check whether a recently granted CO could be promoted to a standing policy.
+ * Embeds the CO's effectDescription and searches for existing policies that
+ * already cover it semantically. Only suggests new policy creation if no
+ * good match exists (distance > threshold).
+ */
+export function checkCOForPolicyPromotion(params: {
+  coEffectDescription: string;
+  coEffects: EffectClass[];
+  policyStore: PolicyStore;
+  embedder: PolicyEmbedder;
+  threshold?: number;
+}): Promise<{
+  shouldPromote: boolean;
+  existingMatch?: { policy: StandingPolicy; distance: number };
+}>;
 ```
 
 #### Safety Constraints on Self-Minted Policies
@@ -1130,7 +1273,7 @@ export function createSelfMintedPolicy(
 - Self-minted policies always start as `status: "pending-confirmation"`
 - Maximum expiry of 30 days (configurable) -- self-minted policies are not permanent
 - Maximum 100 uses before re-confirmation required
-- The confirmation prompt displays the full effect scope, applicability conditions, and the evidence records that motivated the proposal
+- The confirmation prompt displays the full effect scope, applicability conditions, the evidence records that motivated the proposal, and any overlapping policies detected via semantic search
 
 ### 5f. Dynamic Skill Trust Tiers for Plugin Tools
 
@@ -1170,38 +1313,18 @@ In plugin manifest schema, add optional `trustTier` at the tool level:
 
 Implementation: the binder checks `toolProfile.trustTier` (from registry or explicit) during `mintSuccessorWorkOrder`. For `external` tools, policy-based consent anchors are only accepted if the policy has an escalation rule covering the tool's trust tier (preventing external tools from silently consuming broad user policies).
 
-### 5g. Pattern Store Reuse for Policy Matching
+### 5g. ~~Pattern Store Reuse for Policy Matching~~ (Absorbed)
 
-Leverage the consent pattern store from Phase 3a for natural-language policy matching. When a user creates a standing policy with a natural-language description, the system embeds the description and stores it alongside the policy.
+**Status: Absorbed into Phases 5b, 5c, and 5e.**
 
-#### Use Cases
+This phase was originally planned as an optional add-on for embedding-based policy matching. It has been promoted to a first-class capability and absorbed into the upstream phases:
 
-1. **Policy search**: "Do I have a policy that covers file deletion?" → vector similarity search against policy descriptions
-2. **Policy conflict detection**: before activating a new policy, search for existing active policies whose effect scopes overlap and whose descriptions are semantically similar → surface potential conflicts to the user
-3. **CO-to-policy promotion**: when a CO is granted for effects that a policy could cover, suggest policy creation using the CO's `effectDescription` as the seed text
+- **Policy search** (`findSimilarPolicies`): built into the `PolicyStore` interface (Phase 5b) with `sqlite-vec` vec0 virtual table from day one
+- **Policy conflict detection**: integrated into the self-minted policy proposal flow (Phase 5e) via semantic overlap check before proposing
+- **CO-to-policy promotion**: integrated into the proposal flow (Phase 5e) via `checkCOForPolicyPromotion`
+- **Dual-path binder retrieval**: deterministic + semantic retrieval in `mintInitialWorkOrder` / `mintSuccessorWorkOrder` (Phase 5c)
 
-#### Implementation
-
-Add optional embedding support to the policy store:
-
-```typescript
-// In policy-store.ts
-export type PolicyStoreWithEmbeddings = PolicyStore & {
-  /** Store an embedding for a policy (for semantic search). */
-  upsertPolicyEmbedding(policyId: string, embedding: Float32Array): void;
-  /** Find policies semantically similar to a query embedding. */
-  findSimilarPolicies(
-    embedding: Float32Array,
-    topK?: number,
-    threshold?: number,
-  ): Array<{
-    policy: StandingPolicy;
-    distance: number;
-  }>;
-};
-```
-
-This follows the same `sqlite-vec` pattern established in Phase 3a's `implied-consent-store.ts` and Phase 3c's `consent-store.ts`.
+The separate `PolicyStoreWithEmbeddings` type is no longer needed; embedding methods are part of the base `PolicyStore` interface. The embedding text construction helpers (`buildPolicyEmbeddingText`, `buildContextEmbeddingText`) live in `policy.ts`.
 
 ### 5h. Configuration Surface
 
@@ -1223,11 +1346,18 @@ export type ConsentConfig = {
     selfMintedMinRepetitions?: number;
     /** Lookback window for self-minted policy analysis (ms). Default: 7 days. */
     selfMintedLookbackMs?: number;
-    /** Enable policy embedding for semantic search. Default: false. */
-    enableEmbeddings?: boolean;
+    /**
+     * Embedding dimension for semantic policy matching via sqlite-vec.
+     * Set to a positive value to enable (e.g. 384 for MiniLM, 1536 for
+     * text-embedding-3-small). 0 = disabled (deterministic-only retrieval).
+     * Default: 0.
+     */
+    embeddingDimension?: number;
   };
 };
 ```
+
+When `embeddingDimension` is set to a positive value, the policy store creates the `policy_embeddings` vec0 virtual table and the binder enables dual-path retrieval (deterministic + semantic). When 0 or omitted, the system operates in deterministic-only mode with no vec0 overhead.
 
 Add matching Zod schema in `src/config/zod-schema.ts`.
 
