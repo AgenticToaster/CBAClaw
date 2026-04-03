@@ -4,21 +4,30 @@ overview: Implement the Consent-Bound Agency framework via Scope-as-Contract (Sa
 todos:
   - id: phase-0-types
     content: Define EffectClass taxonomy, ToolEffectProfile, and build the effect-registry mapping existing tools to effect classes in src/consent/types.ts and src/consent/effect-registry.ts
-    status: pending
+    status: completed
   - id: phase-1-core
     content: "Build core contract engine: WorkOrder, PurchaseOrder, ChangeOrder types, deterministic binder (src/consent/binder.ts), and AsyncLocalStorage scope chain (src/consent/scope-chain.ts)"
-    status: pending
+    status: completed
   - id: phase-2-integration
     content: "Wire SaC into tool execution: extend AnyAgentTool with effectProfile, add WO verification in before-tool-call hook, mint initial WO at agent run start in attempt.ts"
+    status: completed
+  - id: phase-3a-implied-consent
+    content: "Implied consent derivation: vector-based (SQLite + sqlite-vec) + heuristic dual-path system, 95 seed patterns, orchestrator with 3 modes, config keys, async initializeConsentForRun integration"
+    status: completed
+  - id: phase-3b-change-order
+    content: "Change Order flow: generalize exec/plugin approval manager, gateway methods, protocol schemas, UI surface, CO effect description via pattern store reverse lookup, request ambiguity detection via vector distance"
     status: pending
-  - id: phase-3-consent
-    content: "Implement consent lifecycle: implied-consent derivation, Change Order flow (generalize exec/plugin approval manager), consent record persistence, revocation/withdrawal"
+  - id: phase-3c-consent-records
+    content: "Consent record persistence: per-session store, binder anchor verification, consent precedent reuse via similarity search to skip redundant CO prompts"
+    status: pending
+  - id: phase-3d-revocation
+    content: "Revocation and withdrawal: /cancel and session reset wiring, WO invalidation, consent record cleanup"
     status: pending
   - id: phase-4-eaa
-    content: "Build Elevated Action Analysis: trigger detection, structured adjudication loop, EAA artifact production, system prompt updates for consent-aware agent behavior"
+    content: "Build Elevated Action Analysis: trigger detection (uses ambiguity score from 3b), structured adjudication loop, EAA artifact production, system prompt updates for consent-aware agent behavior"
     status: pending
   - id: phase-5-policies
-    content: Standing policies with bounding boxes, policy classes (user/self-minted/system), dynamic skill trust tiers, effect profiles for plugin tools
+    content: "Standing policies with bounding boxes, policy classes (user/self-minted/system), dynamic skill trust tiers, effect profiles for plugin tools. Pattern store reusable for natural-language policy matching."
     status: pending
   - id: phase-6-observability
     content: Scope chain event model, action receipts (confirmation/receipt/report), gateway protocol extensions for consent methods, metrics tracking
@@ -202,18 +211,17 @@ export type OpenClawPluginToolOptions = {
 
 ## Phase 3: Consent Lifecycle
 
-### 3a. Implied Consent Derivation
+### 3a. Implied Consent Derivation (COMPLETED)
 
-Create `src/consent/implied-consent.ts`. This module analyzes the request text (using deterministic heuristics, not LLM inference) to derive the initial `impliedEffects`:
+Implemented as a vector-based + heuristic dual-path system (see `plans/phase-3-summary.md`):
 
-- Text-only questions --> `["read", "compose"]`
-- "Write a file" / "edit" --> `["read", "compose", "persist"]`
-- "Send a message" / "email" --> `["disclose"]`
-- "Run this command" --> `["exec"]`
-- "Delete" --> `["irreversible"]`
-- "Search the web" --> `["network", "read"]`
-
-This is conservative: the binder uses these as the starting ceiling. When the agent needs more, it must request a CO.
+- `src/consent/implied-consent-seed.ts` — 95 curated canonical patterns covering all 10 EffectClass categories
+- `src/consent/implied-consent-heuristic.ts` — 8 deterministic keyword/regex rules (fallback and augmenter)
+- `src/consent/implied-consent-store.ts` — SQLite + sqlite-vec persistent pattern store with KNN cosine-distance search
+- `src/consent/implied-consent.ts` — orchestrator supporting "vector", "heuristic", and "both" modes with graceful degradation
+- `src/config/types.openclaw.ts` / `zod-schema.ts` — `consent.impliedEffects` config keys (provider, model, threshold, topK, mode)
+- `initializeConsentForRun` is now async, dynamically derives implied effects from request text, loads config
+- Tests: 36 new tests (15 heuristic, 13 store, 8 orchestrator)
 
 ### 3b. Change Order (Explicit Consent) Flow
 
@@ -226,6 +234,23 @@ Generalize the existing `ExecApprovalManager` pattern into a consent-level appro
 - When granted, the binder mints a successor WO (WO') with the expanded grants
 - When denied, the agent must replan within the current WO or refuse
 
+#### 3b-vec. CO Effect Description via Pattern Store (NEW)
+
+Leverage the consent pattern store to generate human-readable CO approval descriptions without LLM calls:
+
+- **Reverse pattern lookup**: given the missing `EffectClass[]` from a `verifyToolConsent` failure, query the `patterns` table for entries whose `effects` JSON overlaps with the missing effects. Return representative natural-language phrases as grounding for the `ChangeOrder.effectDescription` field.
+- Example: missing `["irreversible"]` → surfaces "Delete the temporary files", "Drop the test database" as context anchors → generates description: "This action may permanently remove data (e.g., delete files, drop databases). Proceed?"
+- Implementation: `findPatternsForEffects(effects: EffectClass[], limit?: number): ConsentPattern[]` — a SQL query on the `patterns` table filtered by effects JSON overlap, no vector search needed.
+
+#### 3b-vec. Request Ambiguity Detection (NEW)
+
+Use vector search distance as a quantified ambiguity signal:
+
+- **Ambiguity score**: when `deriveImpliedEffects` runs, capture the distance of the closest pattern match. If the best match distance exceeds an ambiguity threshold (e.g., > 0.6), the request is flagged as underspecified.
+- Export `assessRequestAmbiguity(requestText, store, provider): { ambiguous: boolean, bestDistance: number, matchCount: number }` from `src/consent/implied-consent.ts`.
+- When ambiguous AND the derived effects would cross into dangerous territory (irreversible, elevated, disclose), the CO description includes a caveat: "The intent of your request is unclear. The agent needs [effects] to proceed."
+- Feeds directly into EAA trigger detection (Phase 4a) as the "effect boundary is underspecified" signal, replacing what would otherwise require LLM-based vagueness detection.
+
 ### 3c. Consent Record Persistence
 
 Create `src/consent/consent-store.ts`:
@@ -234,6 +259,16 @@ Create `src/consent/consent-store.ts`:
 - Each record: `{ id, poId, woId, effectClasses, decision, timestamp, expiresAt }`
 - Used by the binder to verify consent anchors
 - Queryable for audit and explainability
+
+#### 3c-vec. Consent Precedent Reuse via Similarity Search (NEW)
+
+Avoid redundant CO prompts by matching new CO requests against prior consent records using vector similarity:
+
+- **Consent precedent lookup**: when a CO would be triggered, first embed the new CO's context (tool name + request text) and search against prior consent records from the same session that were granted.
+- If a prior consent record covers semantically equivalent operations (same effect classes, similar request text, within expiry), reuse it as an implicit consent anchor instead of prompting the user again.
+- Example: user granted "Delete the temporary files" (effects: `[irreversible, persist]`). Later the agent needs "Remove old log files" (same effects). Similarity search finds the prior consent; agent proceeds without re-prompting.
+- Implementation: extend `consent-store.ts` to embed consent record descriptions at storage time. Add `findSimilarConsentPrecedent(embedding, effects, sessionKey): ConsentRecord | undefined` query.
+- Precedent reuse is conservative: only matches when (a) effects are a subset of the prior grant, (b) distance is below a tight threshold (e.g., 0.25), and (c) the prior record has not expired.
 
 ### 3d. Revocation and Withdrawal
 
@@ -250,7 +285,7 @@ Create `src/consent/consent-store.ts`:
 Create `src/consent/eaa-triggers.ts`. EAA is triggered when:
 
 - Standing/role is ambiguous (sender not owner, channel is group, etc.)
-- Effect boundary is underspecified (request is vague: "handle this")
+- Effect boundary is underspecified — detected via the **request ambiguity score** from Phase 3b-vec (`assessRequestAmbiguity`): if `bestDistance > 0.6` AND derived effects include `irreversible`, `elevated`, `disclose`, or `audience-expand`, trigger EAA
 - Duty collision detected (e.g., delete request vs. evidence preservation)
 - Tool has `trustTier: "external"` and involves `disclose` or `irreversible` effects
 - Tool is in `DANGEROUS_ACP_TOOL_NAMES` (already flagged in `[src/security/dangerous-tools.ts](src/security/dangerous-tools.ts)`)
@@ -373,15 +408,17 @@ Track and expose:
 flowchart TD
     P0["Phase 0: Effect taxonomy + tool classification"] --> P1["Phase 1: Core contract engine (types, binder, scope chain)"]
     P1 --> P2["Phase 2: Wire into tool execution pipeline"]
-    P2 --> P3a["Phase 3a: Implied consent derivation"]
-    P2 --> P3b["Phase 3b: Change Order flow (generalize approvals)"]
-    P3a --> P4["Phase 4: EAA triggers + adjudication"]
-    P3b --> P4
-    P4 --> P5["Phase 5: Standing policies + trust tiers"]
+    P2 --> P3a["Phase 3a: Implied consent derivation ✅"]
+    P3a --> P3b["Phase 3b: Change Order flow + CO description via pattern store + ambiguity detection"]
+    P3a --> P3c["Phase 3c: Consent record persistence + precedent reuse via similarity search"]
+    P3b --> P3d["Phase 3d: Revocation and withdrawal"]
+    P3c --> P3d
+    P3d --> P4["Phase 4: EAA triggers (uses ambiguity score from 3b) + adjudication"]
+    P4 --> P5["Phase 5: Standing policies + trust tiers (pattern store reusable for policy matching)"]
     P5 --> P6["Phase 6: Observability, receipts, metrics"]
 ```
 
-Phases 0-2 are foundational and sequential. Phase 3a and 3b can proceed in parallel. Phases 4-6 build on the foundation.
+Phases 0-2 are foundational and sequential. Phase 3a (completed) provides the vector store infrastructure that 3b, 3c, and 4a build upon. Phase 3b and 3c can proceed in parallel. Phase 5 can optionally reuse the pattern store for standing policy matching.
 
 ---
 
@@ -389,18 +426,22 @@ Phases 0-2 are foundational and sequential. Phase 3a and 3b can proceed in paral
 
 **New files** (all under `src/consent/`):
 
-- `types.ts` -- EffectClass, WorkOrder, PurchaseOrder, ChangeOrder, ConsentRecord, EAARecord, StandingPolicy
-- `binder.ts` -- Deterministic contract binder (sole WO minter)
-- `scope-chain.ts` -- AsyncLocalStorage-based consent scope
-- `effect-registry.ts` -- Tool-to-effect-class mapping table
-- `implied-consent.ts` -- Request analysis for implied effects
-- `change-order.ts` -- CO request/resolve flow
-- `consent-store.ts` -- Consent record persistence
-- `eaa.ts` -- Elevated Action Analysis engine
-- `eaa-triggers.ts` -- EAA trigger detection
-- `policy.ts` -- Standing policies with bounding boxes
-- `events.ts` -- Scope chain event model
-- `remediation.ts` -- Breach containment + remediation protocol
+- `types.ts` -- EffectClass, WorkOrder, PurchaseOrder, ChangeOrder, ConsentRecord, EAARecord, StandingPolicy ✅
+- `binder.ts` -- Deterministic contract binder (sole WO minter) ✅
+- `scope-chain.ts` -- AsyncLocalStorage-based consent scope ✅
+- `effect-registry.ts` -- Tool-to-effect-class mapping table ✅
+- `integration.ts` -- Pipeline integration: PO factory, WO init, enforcement, verification ✅
+- `implied-consent.ts` -- Orchestrator: vector search + heuristic + fallback ✅
+- `implied-consent-store.ts` -- SQLite + sqlite-vec persistent pattern store ✅
+- `implied-consent-seed.ts` -- 95 curated canonical request patterns ✅
+- `implied-consent-heuristic.ts` -- 8 deterministic keyword/regex rules ✅
+- `change-order.ts` -- CO request/resolve flow (Phase 3b)
+- `consent-store.ts` -- Consent record persistence with similarity-based precedent reuse (Phase 3c)
+- `eaa.ts` -- Elevated Action Analysis engine (Phase 4)
+- `eaa-triggers.ts` -- EAA trigger detection, uses ambiguity score from pattern store (Phase 4)
+- `policy.ts` -- Standing policies with bounding boxes (Phase 5)
+- `events.ts` -- Scope chain event model (Phase 6)
+- `remediation.ts` -- Breach containment + remediation protocol (Phase 6)
 
 **Modified files**:
 
