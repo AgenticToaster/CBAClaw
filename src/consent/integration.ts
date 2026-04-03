@@ -16,8 +16,12 @@ import { randomUUID } from "node:crypto";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { configureSigningKey, mintInitialWorkOrder, verifyToolAgainstWO } from "./binder.js";
 import { getToolEffectProfile } from "./effect-registry.js";
+import type { PolicyStore } from "./policy-store.js";
+import { DEFAULT_SYSTEM_POLICIES } from "./policy.js";
+import type { StandingPolicy } from "./policy.js";
 import { createInitialConsentScopeState, getActiveWorkOrder } from "./scope-chain.js";
 import type {
+  BinderPolicy,
   ConsentScopeState,
   EffectClass,
   PurchaseOrder,
@@ -142,6 +146,10 @@ export type ConsentRunContext = {
   po: PurchaseOrder;
   wo: WorkOrder;
   enforcement: ConsentEnforcementMode;
+  /** Active standing policies loaded at initialization (Phase 5i). */
+  activePolicies: readonly StandingPolicy[];
+  /** Policy store reference, if policies are enabled. */
+  policyStore?: PolicyStore;
 };
 
 /**
@@ -149,12 +157,20 @@ export type ConsentRunContext = {
  * effects from the request text (vector search + heuristic), creates a PO,
  * mints the initial WO, and builds the scope state.
  *
+ * When a policyStore is provided (Phase 5i), active policies are loaded,
+ * stale policies are expired, and the combined policy set (active + system
+ * defaults) is passed to the binder for initial WO minting.
+ *
  * Returns undefined if initialization fails (binder refused the WO).
  * Callers should treat undefined as "consent not available" and proceed
  * without consent enforcement.
  */
 export async function initializeConsentForRun(
-  params: CreatePurchaseOrderParams & { env?: NodeJS.ProcessEnv },
+  params: CreatePurchaseOrderParams & {
+    env?: NodeJS.ProcessEnv;
+    /** Pre-opened policy store (Phase 5i). Omit to skip policy loading. */
+    policyStore?: PolicyStore;
+  },
 ): Promise<ConsentRunContext | undefined> {
   initializeSigningKey(params.env);
   const enforcement = resolveConsentEnforcementMode(params.env);
@@ -164,7 +180,6 @@ export async function initializeConsentForRun(
   if (!impliedEffects) {
     try {
       const { deriveImpliedEffects } = await import("./implied-consent.js");
-      // Load consent config from the main config if available
       let consentConfig: Record<string, unknown> | undefined;
       try {
         const { loadConfig } = await import("../config/config.js");
@@ -184,11 +199,30 @@ export async function initializeConsentForRun(
     }
   }
 
+  // Phase 5i: load active policies from store, expire stale ones.
+  // Only load system + user policies when a policy store is provided,
+  // preserving backward compatibility for existing callers.
+  let allPolicies: BinderPolicy[] = [];
+  let activePolicies: StandingPolicy[] = [];
+  if (params.policyStore) {
+    try {
+      const expired = params.policyStore.expireStalePolicies();
+      if (expired > 0) {
+        log.debug(`expired ${expired} stale policies during initialization`);
+      }
+      activePolicies = params.policyStore.getActivePolicies();
+      log.debug(`loaded ${activePolicies.length} active policies from store`);
+      allPolicies = [...DEFAULT_SYSTEM_POLICIES, ...activePolicies];
+    } catch (err) {
+      log.warn(`failed to load policies from store: ${String(err)}`);
+    }
+  }
+
   const po = createPurchaseOrder({ ...params, impliedEffects });
 
   const result = mintInitialWorkOrder({
     po,
-    policies: [],
+    policies: allPolicies,
     systemProhibitions: [],
   });
 
@@ -212,6 +246,8 @@ export async function initializeConsentForRun(
     po,
     wo: result.wo,
     enforcement,
+    activePolicies: allPolicies,
+    policyStore: params.policyStore,
   };
 }
 

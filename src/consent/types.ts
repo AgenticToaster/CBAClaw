@@ -276,10 +276,20 @@ export type ConsentScopeState = {
 /** Input to the deterministic binder when minting an initial WO. */
 export type BinderMintInput = {
   po: PurchaseOrder;
-  /** Active standing policies (Phase 5, stubbed for now). */
-  policies: readonly StandingPolicyStub[];
+  /**
+   * Standing policies — full StandingPolicy objects are evaluated for grants
+   * and escalation rules; legacy StandingPolicyStub objects are silently skipped.
+   */
+  policies: readonly (StandingPolicyStub | BinderPolicy)[];
   /** System-level prohibited effects that override all consent. */
   systemProhibitions: EffectClass[];
+  /**
+   * Pre-resolved semantic policy candidates from embedding search (Phase 5c).
+   * The binder validates these through the same deterministic gauntlet
+   * (applicability, expiry, escalation) before using them as anchors.
+   * Merged with the deterministic results from `policies`, deduplicated by id.
+   */
+  semanticPolicyCandidates?: readonly BinderPolicy[];
 };
 
 /** Input to the deterministic binder when requalifying (minting WO'). */
@@ -292,10 +302,22 @@ export type BinderRequalifyInput = {
   newAnchors: ConsentAnchor[];
   /** Additional effects being granted via CO or EAA. */
   additionalEffects: EffectClass[];
-  policies: readonly StandingPolicyStub[];
+  /** Standing policies — see BinderMintInput.policies. */
+  policies: readonly (StandingPolicyStub | BinderPolicy)[];
   systemProhibitions: EffectClass[];
   constraints?: WOConstraint[];
+  /** Tool name for escalation rule evaluation context. */
+  toolName?: string;
+  /** Pre-resolved semantic policy candidates — see BinderMintInput. */
+  semanticPolicyCandidates?: readonly BinderPolicy[];
 };
+
+/**
+ * Opaque brand for StandingPolicy objects passed to the binder.
+ * Uses `import("./policy.js").StandingPolicy` at the type level to avoid
+ * a circular import from types.ts → policy.ts at runtime.
+ */
+export type BinderPolicy = import("./policy.js").StandingPolicy;
 
 /**
  * Result of a binder operation. Discriminated on `ok` so callers use

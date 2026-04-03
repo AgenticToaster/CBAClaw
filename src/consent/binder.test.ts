@@ -10,11 +10,14 @@ import {
   verifyToolAgainstWO,
   verifyWorkOrderIntegrity,
 } from "./binder.js";
+import type { StandingPolicy } from "./policy.js";
+import { DEFAULT_SYSTEM_POLICIES } from "./policy.js";
 import type {
   BinderMintInput,
   BinderRequalifyInput,
   ConsentRecord,
   EAARecord,
+  EffectClass,
   PurchaseOrder,
   ToolEffectProfile,
   WorkOrder,
@@ -1095,6 +1098,842 @@ describe("binder", () => {
       });
       // Top-level: a before z. Nested: b before c.
       expect(result).toBe('{"a":{"b":2,"c":3},"z":1}');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // Phase 5c: Standing Policy Evaluation in the Binder
+  // ---------------------------------------------------------------------------
+
+  describe("Phase 5c: policy evaluation in mintInitialWorkOrder", () => {
+    function makePolicy(overrides: Partial<StandingPolicy> = {}): StandingPolicy {
+      return {
+        id: "pol-test",
+        class: "user",
+        effectScope: ["persist"],
+        applicability: {},
+        escalationRules: [],
+        expiry: { currentUses: 0 },
+        revocationSemantics: "immediate",
+        provenance: { author: "owner", createdAt: Date.now() },
+        description: "Test policy",
+        status: "active",
+        ...overrides,
+      };
+    }
+
+    it("grants additional effects from an active user policy", () => {
+      const policy = makePolicy({
+        id: "pol-persist",
+        effectScope: ["persist", "disclose"],
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read", "compose"] }),
+        policies: [policy],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toContain("read");
+      expect(result.wo.grantedEffects).toContain("compose");
+      expect(result.wo.grantedEffects).toContain("persist");
+      expect(result.wo.grantedEffects).toContain("disclose");
+
+      const policyAnchor = result.wo.consentAnchors.find((a) => a.kind === "policy");
+      expect(policyAnchor).toBeDefined();
+      expect(policyAnchor?.policyId).toBe("pol-persist");
+    });
+
+    it("does not grant effects from inactive policies", () => {
+      const policy = makePolicy({
+        effectScope: ["persist"],
+        status: "revoked",
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [policy],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toEqual(["read"]);
+      expect(result.wo.consentAnchors.find((a) => a.kind === "policy")).toBeUndefined();
+    });
+
+    it("does not grant effects from expired policies", () => {
+      const policy = makePolicy({
+        effectScope: ["persist"],
+        expiry: { expiresAt: Date.now() - 1000, currentUses: 0 },
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [policy],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).not.toContain("persist");
+    });
+
+    it("does not grant system-prohibited effects even from policies", () => {
+      const policy = makePolicy({
+        effectScope: ["exec"],
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [policy],
+        systemProhibitions: ["exec"],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).not.toContain("exec");
+    });
+
+    it("skips policy grants when escalation rules fire", () => {
+      const policy = makePolicy({
+        effectScope: ["persist"],
+        escalationRules: [
+          {
+            condition: { kind: "effect-combination", effects: ["persist"] as EffectClass[] },
+            action: "require-co",
+            description: "Persist always needs CO",
+          },
+        ],
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read", "persist"] }),
+        policies: [policy],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      // The policy is escalated, so no policy anchor
+      const policyAnchors = result.wo.consentAnchors.filter((a) => a.kind === "policy");
+      expect(policyAnchors).toHaveLength(0);
+    });
+
+    it("applies policies from DEFAULT_SYSTEM_POLICIES", () => {
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read", "compose"] }),
+        policies: [...DEFAULT_SYSTEM_POLICIES],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toContain("read");
+      expect(result.wo.grantedEffects).toContain("compose");
+
+      // system-policy-read-compose should anchor (covers existing grants)
+      const policyAnchors = result.wo.consentAnchors.filter((a) => a.kind === "policy");
+      expect(policyAnchors.some((a) => a.policyId === "system-policy-read-compose")).toBe(true);
+    });
+
+    it("system policy escalation (physical → trigger-eaa) prevents grant", () => {
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read", "physical"] }),
+        policies: [...DEFAULT_SYSTEM_POLICIES],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      // The physical system policy has an escalation for physical effects
+      // so it should be suppressed — physical stays from implied only
+      const physicalPolicyAnchor = result.wo.consentAnchors.find(
+        (a) => a.kind === "policy" && a.policyId === "system-policy-no-physical-without-eaa",
+      );
+      expect(physicalPolicyAnchor).toBeUndefined();
+    });
+
+    it("merges multiple policies without duplicating effects", () => {
+      const policy1 = makePolicy({
+        id: "pol-1",
+        effectScope: ["persist", "disclose"],
+      });
+      const policy2 = makePolicy({
+        id: "pol-2",
+        effectScope: ["persist", "exec"],
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [policy1, policy2],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      const persistCount = result.wo.grantedEffects.filter((e) => e === "persist").length;
+      expect(persistCount).toBe(1);
+      expect(result.wo.grantedEffects).toContain("disclose");
+      expect(result.wo.grantedEffects).toContain("exec");
+    });
+
+    it("self-minted policy only applies when status is active", () => {
+      const pending = makePolicy({
+        id: "pol-pending",
+        class: "self-minted",
+        effectScope: ["persist"],
+        status: "pending-confirmation",
+      });
+      const confirmed = makePolicy({
+        id: "pol-confirmed",
+        class: "self-minted",
+        effectScope: ["disclose"],
+        status: "active",
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [pending, confirmed],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).not.toContain("persist");
+      expect(result.wo.grantedEffects).toContain("disclose");
+    });
+
+    it("policy with channel applicability is filtered by PO channel", () => {
+      const policy = makePolicy({
+        effectScope: ["persist"],
+        applicability: { channels: ["telegram"] },
+      });
+
+      const matchingPO = makePO({ impliedEffects: ["read"], channel: "telegram" });
+      const nonMatchingPO = makePO({ impliedEffects: ["read"], channel: "discord" });
+
+      const result1 = mintInitialWorkOrder({
+        po: matchingPO,
+        policies: [policy],
+        systemProhibitions: [],
+      });
+      expect(result1.ok).toBe(true);
+      if (result1.ok) {
+        expect(result1.wo.grantedEffects).toContain("persist");
+      }
+
+      const result2 = mintInitialWorkOrder({
+        po: nonMatchingPO,
+        policies: [policy],
+        systemProhibitions: [],
+      });
+      expect(result2.ok).toBe(true);
+      if (result2.ok) {
+        expect(result2.wo.grantedEffects).not.toContain("persist");
+      }
+    });
+
+    it("backward compatible: empty policies array works as before", () => {
+      const input: BinderMintInput = {
+        po: makePO(),
+        policies: [],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toEqual(["read", "compose", "persist"]);
+      expect(result.wo.consentAnchors).toEqual([{ kind: "implied", poId: "po-1" }]);
+    });
+
+    it("backward compatible: StandingPolicyStub objects are silently skipped", () => {
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [{ id: "stub-1", policyClass: "user", effectScope: ["persist"] }],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toEqual(["read"]);
+      expect(result.wo.consentAnchors.filter((a) => a.kind === "policy")).toHaveLength(0);
+    });
+  });
+
+  describe("Phase 5c: semantic policy candidates (dual-path)", () => {
+    function makePolicy(overrides: Partial<StandingPolicy> = {}): StandingPolicy {
+      return {
+        id: "pol-semantic",
+        class: "user",
+        effectScope: ["persist"],
+        applicability: {},
+        escalationRules: [],
+        expiry: { currentUses: 0 },
+        revocationSemantics: "immediate",
+        provenance: { author: "owner", createdAt: Date.now() },
+        description: "Semantic candidate",
+        status: "active",
+        ...overrides,
+      };
+    }
+
+    it("semantic candidates are merged with deterministic results", () => {
+      const deterministicPolicy = makePolicy({
+        id: "pol-det",
+        effectScope: ["persist"],
+      });
+      const semanticPolicy = makePolicy({
+        id: "pol-sem",
+        effectScope: ["disclose"],
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [deterministicPolicy],
+        systemProhibitions: [],
+        semanticPolicyCandidates: [semanticPolicy],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toContain("persist");
+      expect(result.wo.grantedEffects).toContain("disclose");
+    });
+
+    it("deduplicates when same policy appears in both paths", () => {
+      const policy = makePolicy({ id: "pol-dup", effectScope: ["persist"] });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [policy],
+        systemProhibitions: [],
+        semanticPolicyCandidates: [policy],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      const policyAnchors = result.wo.consentAnchors.filter(
+        (a) => a.kind === "policy" && a.policyId === "pol-dup",
+      );
+      expect(policyAnchors).toHaveLength(1);
+    });
+
+    it("semantic candidates are validated (inactive skipped)", () => {
+      const revokedSemantic = makePolicy({
+        id: "pol-revoked-sem",
+        effectScope: ["persist"],
+        status: "revoked",
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [],
+        systemProhibitions: [],
+        semanticPolicyCandidates: [revokedSemantic],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).not.toContain("persist");
+    });
+
+    it("semantic candidates are validated (expired skipped)", () => {
+      const expiredSemantic = makePolicy({
+        id: "pol-expired-sem",
+        effectScope: ["persist"],
+        expiry: { expiresAt: Date.now() - 1000, currentUses: 0 },
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"] }),
+        policies: [],
+        systemProhibitions: [],
+        semanticPolicyCandidates: [expiredSemantic],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).not.toContain("persist");
+    });
+
+    it("semantic candidates are validated (non-matching applicability skipped)", () => {
+      const telegramOnly = makePolicy({
+        id: "pol-telegram-sem",
+        effectScope: ["persist"],
+        applicability: { channels: ["telegram"] },
+      });
+
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"], channel: "discord" }),
+        policies: [],
+        systemProhibitions: [],
+        semanticPolicyCandidates: [telegramOnly],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).not.toContain("persist");
+      expect(result.wo.consentAnchors.filter((a) => a.kind === "policy")).toHaveLength(0);
+    });
+  });
+
+  describe("Phase 5c: policy evaluation in mintSuccessorWorkOrder", () => {
+    function makePolicy(overrides: Partial<StandingPolicy> = {}): StandingPolicy {
+      return {
+        id: "pol-requalify",
+        class: "user",
+        effectScope: ["disclose"],
+        applicability: {},
+        escalationRules: [],
+        expiry: { currentUses: 0 },
+        revocationSemantics: "immediate",
+        provenance: { author: "owner", createdAt: Date.now() },
+        description: "Requalification policy",
+        status: "active",
+        ...overrides,
+      };
+    }
+
+    it("expands grants from policies during requalification", () => {
+      const policy = makePolicy({
+        id: "pol-req-expand",
+        effectScope: ["disclose"],
+      });
+
+      const input: BinderRequalifyInput = {
+        currentWO: makeWO({ grantedEffects: ["read", "compose"] }),
+        po: makePO(),
+        stepEffectProfile: {
+          effects: ["read", "compose", "disclose"],
+          trustTier: "in-process",
+        },
+        newAnchors: [],
+        additionalEffects: [],
+        policies: [policy],
+        systemProhibitions: [],
+      };
+
+      const result = mintSuccessorWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toContain("disclose");
+      expect(
+        result.wo.consentAnchors.some(
+          (a) => a.kind === "policy" && a.policyId === "pol-req-expand",
+        ),
+      ).toBe(true);
+    });
+
+    it("policy-granted effects are bounded by step ceiling", () => {
+      const policy = makePolicy({
+        effectScope: ["disclose", "exec"],
+      });
+
+      const input: BinderRequalifyInput = {
+        currentWO: makeWO({ grantedEffects: ["read"] }),
+        po: makePO(),
+        stepEffectProfile: {
+          effects: ["read", "disclose"],
+          trustTier: "in-process",
+        },
+        newAnchors: [],
+        additionalEffects: [],
+        policies: [policy],
+        systemProhibitions: [],
+      };
+
+      const result = mintSuccessorWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toContain("disclose");
+      expect(result.wo.grantedEffects).not.toContain("exec");
+    });
+
+    it("evaluates escalation rules with tool context at requalification", () => {
+      const policy = makePolicy({
+        effectScope: ["disclose"],
+        escalationRules: [
+          {
+            condition: { kind: "trust-tier-below", tier: "in-process" as const },
+            action: "require-co",
+            description: "External tools need CO for disclose",
+          },
+        ],
+      });
+
+      const input: BinderRequalifyInput = {
+        currentWO: makeWO({ grantedEffects: ["read"] }),
+        po: makePO(),
+        stepEffectProfile: {
+          effects: ["read", "disclose"],
+          trustTier: "external",
+        },
+        newAnchors: [],
+        additionalEffects: [],
+        policies: [policy],
+        systemProhibitions: [],
+        toolName: "external-tool",
+      };
+
+      const result = mintSuccessorWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      // Escalation fires for external trust tier, so policy is not applied
+      expect(result.wo.grantedEffects).not.toContain("disclose");
+    });
+
+    it("semantic candidates in successor merge with deterministic", () => {
+      const deterPolicy = makePolicy({ id: "pol-det-req", effectScope: ["persist"] });
+      const semPolicy = makePolicy({ id: "pol-sem-req", effectScope: ["disclose"] });
+
+      const input: BinderRequalifyInput = {
+        currentWO: makeWO({ grantedEffects: ["read"] }),
+        po: makePO(),
+        stepEffectProfile: {
+          effects: ["read", "persist", "disclose"],
+          trustTier: "in-process",
+        },
+        newAnchors: [],
+        additionalEffects: [],
+        policies: [deterPolicy],
+        systemProhibitions: [],
+        semanticPolicyCandidates: [semPolicy],
+      };
+
+      const result = mintSuccessorWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toContain("persist");
+      expect(result.wo.grantedEffects).toContain("disclose");
+    });
+
+    it("backward compatible: empty policies in requalification", () => {
+      const input: BinderRequalifyInput = {
+        currentWO: makeWO(),
+        po: makePO(),
+        stepEffectProfile: {
+          effects: ["read", "compose", "persist", "disclose"],
+          trustTier: "in-process",
+        },
+        newAnchors: [{ kind: "explicit", consentRecordId: "cr-1" }],
+        additionalEffects: ["disclose"],
+        policies: [],
+        systemProhibitions: [],
+      };
+
+      const result = mintSuccessorWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+
+      expect(result.wo.grantedEffects).toContain("disclose");
+    });
+  });
+
+  describe("Phase 5c: verifyConsentAnchorAgainstRecords with policy store", () => {
+    function makePolicyStore(policies: Record<string, StandingPolicy>) {
+      return {
+        getPolicy(id: string) {
+          return policies[id];
+        },
+      } as import("./policy-store.js").PolicyStore;
+    }
+
+    function makePolicy(overrides: Partial<StandingPolicy> = {}): StandingPolicy {
+      return {
+        id: "pol-verify",
+        class: "user",
+        effectScope: ["persist", "read"],
+        applicability: {},
+        escalationRules: [],
+        expiry: { currentUses: 0 },
+        revocationSemantics: "immediate",
+        provenance: { author: "owner", createdAt: Date.now() },
+        description: "Verify policy",
+        status: "active",
+        ...overrides,
+      };
+    }
+
+    it("accepts policy anchor when policy exists, is active, and covers effects", () => {
+      const store = makePolicyStore({
+        "pol-ok": makePolicy({ id: "pol-ok", effectScope: ["persist", "read"] }),
+      });
+
+      const result = verifyConsentAnchorAgainstRecords(
+        { kind: "policy", policyId: "pol-ok" },
+        ["read", "persist"],
+        [],
+        [],
+        store,
+      );
+      expect(result.valid).toBe(true);
+    });
+
+    it("rejects policy anchor when policy is not found", () => {
+      const store = makePolicyStore({});
+
+      const result = verifyConsentAnchorAgainstRecords(
+        { kind: "policy", policyId: "pol-missing" },
+        ["read"],
+        [],
+        [],
+        store,
+      );
+      expect(result.valid).toBe(false);
+      if (!result.valid) {
+        expect(result.reason).toContain("not found");
+      }
+    });
+
+    it("rejects policy anchor when policy is revoked", () => {
+      const store = makePolicyStore({
+        "pol-rev": makePolicy({ id: "pol-rev", status: "revoked" }),
+      });
+
+      const result = verifyConsentAnchorAgainstRecords(
+        { kind: "policy", policyId: "pol-rev" },
+        ["read"],
+        [],
+        [],
+        store,
+      );
+      expect(result.valid).toBe(false);
+      if (!result.valid) {
+        expect(result.reason).toContain("revoked");
+      }
+    });
+
+    it("rejects policy anchor when policy is expired", () => {
+      const store = makePolicyStore({
+        "pol-exp": makePolicy({
+          id: "pol-exp",
+          expiry: { expiresAt: Date.now() - 1000, currentUses: 0 },
+        }),
+      });
+
+      const result = verifyConsentAnchorAgainstRecords(
+        { kind: "policy", policyId: "pol-exp" },
+        ["read"],
+        [],
+        [],
+        store,
+      );
+      expect(result.valid).toBe(false);
+      if (!result.valid) {
+        expect(result.reason).toContain("expired");
+      }
+    });
+
+    it("rejects policy anchor when effects are not covered", () => {
+      const store = makePolicyStore({
+        "pol-narrow": makePolicy({
+          id: "pol-narrow",
+          effectScope: ["read"],
+        }),
+      });
+
+      const result = verifyConsentAnchorAgainstRecords(
+        { kind: "policy", policyId: "pol-narrow" },
+        ["read", "persist"],
+        [],
+        [],
+        store,
+      );
+      expect(result.valid).toBe(false);
+      if (!result.valid) {
+        expect(result.reason).toContain("persist");
+      }
+    });
+
+    it("falls back to accept when no policy store is provided", () => {
+      const result = verifyConsentAnchorAgainstRecords(
+        { kind: "policy", policyId: "pol-any" },
+        ["read"],
+        [],
+        [],
+      );
+      expect(result.valid).toBe(true);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // Phase 5f: External-tool policy enforcement
+  // -----------------------------------------------------------------------
+
+  describe("external-tool policy enforcement (5f)", () => {
+    function make5fPolicy(overrides: Partial<StandingPolicy> = {}): StandingPolicy {
+      return {
+        id: "pol-5f",
+        class: "user",
+        effectScope: ["persist"],
+        applicability: {},
+        escalationRules: [],
+        expiry: { currentUses: 0 },
+        revocationSemantics: "immediate",
+        provenance: { author: "owner", createdAt: Date.now() },
+        description: "5f test policy",
+        status: "active",
+        ...overrides,
+      };
+    }
+
+    it("external tool can consume system policies without trust-tier rule", () => {
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read"], channel: "discord" }),
+        policies: [
+          make5fPolicy({
+            id: "sys-read",
+            class: "system",
+            effectScope: ["read"],
+          }),
+        ],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+      expect(result.wo.grantedEffects).toContain("read");
+    });
+
+    it("external tool is blocked from consuming user policy without trust-tier rule", () => {
+      const userPolicy = make5fPolicy({
+        id: "user-persist-no-tier",
+        effectScope: ["persist"],
+      });
+
+      const input: BinderRequalifyInput = {
+        currentWO: makeWO({ grantedEffects: ["read"] }),
+        po: makePO({ impliedEffects: ["read", "persist"] }),
+        stepEffectProfile: { effects: ["read", "persist"], trustTier: "external" },
+        newAnchors: [],
+        additionalEffects: [],
+        policies: [userPolicy],
+        systemProhibitions: [],
+      };
+
+      const result = mintSuccessorWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+      // User policy without trust-tier rule should be skipped for external tools
+      const policyAnchors = result.wo.consentAnchors.filter((a) => a.kind === "policy");
+      expect(policyAnchors).toHaveLength(0);
+      expect(result.wo.grantedEffects).not.toContain("persist");
+    });
+
+    it("external tool can consume user policy that includes trust-tier-below rule", () => {
+      const userPolicy = make5fPolicy({
+        id: "user-persist-tiered",
+        effectScope: ["persist"],
+        escalationRules: [
+          {
+            condition: { kind: "trust-tier-below" as const, tier: "sandboxed" as const },
+            action: "trigger-eaa" as const,
+            description: "External tools require EAA for persist",
+          },
+        ],
+      });
+
+      // At initial mint, tool context uses default "in-process" trust tier,
+      // which meets "sandboxed" threshold → escalation does NOT fire → grants.
+      const input: BinderMintInput = {
+        po: makePO({ impliedEffects: ["read", "persist"] }),
+        policies: [userPolicy],
+        systemProhibitions: [],
+      };
+
+      const result = mintInitialWorkOrder(input);
+      expect(result.ok).toBe(true);
+      if (!result.ok) {
+        return;
+      }
+      expect(result.wo.grantedEffects).toContain("persist");
+      expect(result.wo.consentAnchors.some((a) => a.kind === "policy")).toBe(true);
     });
   });
 });

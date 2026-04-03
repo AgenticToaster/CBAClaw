@@ -9,6 +9,7 @@
 // Types
 export type {
   BinderMintInput,
+  BinderPolicy,
   BinderRequalifyInput,
   BinderRefusalCode,
   BinderResult,
@@ -46,6 +47,7 @@ export {
 } from "./effect-registry.js";
 
 // Binder
+export type { PolicyEmbedder } from "./binder.js";
 export {
   configureSigningKey,
   decodeWorkOrderToken,
@@ -202,7 +204,12 @@ export {
   isExpired,
   isFullStandingPolicy,
   meetsTrustTier,
+  recordAndCheckUsage,
 } from "./policy.js";
+
+// Phase 5a/5f: Trust Tier Derivation
+export type { ToolSource } from "./policy.js";
+export { deriveTrustTier } from "./policy.js";
 
 // Phase 5b: Policy Store (Persistence + Vector Similarity)
 export type { OpenPolicyStoreParams, PolicyStore } from "./policy-store.js";
@@ -211,3 +218,16 @@ export {
   resolveDefaultPolicyStorePath,
   resolvePolicyStorePath,
 } from "./policy-store.js";
+
+// Phase 5e: Self-Minted Policy Proposal
+export type {
+  CheckCOPromotionParams,
+  COPromotionResult,
+  PolicyProposal,
+  PolicyProposalParams,
+} from "./policy-proposal.js";
+export {
+  analyzeForPolicyProposals,
+  checkCOForPolicyPromotion,
+  createSelfMintedPolicy,
+} from "./policy-proposal.js";

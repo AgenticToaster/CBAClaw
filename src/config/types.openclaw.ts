@@ -138,6 +138,25 @@ export type ConsentConfig = {
     /** Derivation mode: "vector", "heuristic", or "both". Default: "both". */
     mode?: "vector" | "heuristic" | "both";
   };
+  policies?: {
+    /** Enable standing policy framework. Default: false (Phase 5 opt-in). */
+    enabled?: boolean;
+    /** Path to policy store SQLite database. Default: auto-resolved. */
+    storePath?: string;
+    /** Maximum expiry for self-minted policies (ms). Default: 30 days. */
+    selfMintedMaxExpiryMs?: number;
+    /** Minimum CO grant repetitions before self-minted policy proposal. Default: 3. */
+    selfMintedMinRepetitions?: number;
+    /** Lookback window for self-minted policy analysis (ms). Default: 7 days. */
+    selfMintedLookbackMs?: number;
+    /**
+     * Embedding dimension for semantic policy matching via sqlite-vec.
+     * Set to a positive value to enable (e.g. 384 for MiniLM, 1536 for
+     * text-embedding-3-small). 0 = disabled (deterministic-only retrieval).
+     * Default: 0.
+     */
+    embeddingDimension?: number;
+  };
 };
 
 declare const openClawConfigStateBrand: unique symbol;

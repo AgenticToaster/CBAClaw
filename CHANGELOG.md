@@ -3,6 +3,86 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.9.0 — 2026-04-02
+
+Phase 5c–5i: Binder dual-path policy evaluation, default system policies, self-minted policy proposals, dynamic trust tiers, configuration surface, and pipeline integration.
+
+### Phase 5c: Binder Policy Evaluation with Dual-Path Retrieval (`src/consent/binder.ts`)
+
+- `evaluatePoliciesForGrants`: new internal function that evaluates standing policies during WO minting (both initial and successor). Implements dual-path retrieval:
+  - **Deterministic path** (always runs): `filterApplicablePolicies` checks status, expiry, and applicability predicates against the runtime `PolicyMatchContext`.
+  - **Semantic path** (optional): embeds the current context via `PolicyEmbedder`, calls `findSimilarPolicies` on the policy store, then validates each semantic candidate through the same deterministic gauntlet (no validation gap).
+  - Merge + dedup by policy ID. Sorted by class precedence: system → user → self-minted.
+- `PolicyEmbedder` type: `(text: string) => Promise<Float32Array>`. Accepted by `BinderMintInput` and `BinderRequalifyInput` via the optional `semanticPolicyCandidates` field. When absent, the binder falls back to deterministic-only retrieval (backward compatible with Phases 0-4).
+- Escalation rule evaluation: for each applicable policy, `evaluateEscalationRules` is called against the `EscalationContext`. If any rule fires, the policy is skipped entirely (no partial grants).
+- Policy anchor recording: policies only produce `{ kind: "policy", policyId }` consent anchors when they contribute at least one new effect or validate an already-granted effect.
+
+### Phase 5d: Default System Policies (`src/consent/policy.ts`)
+
+- `DEFAULT_SYSTEM_POLICIES`: 3 hardcoded system-class policies loaded at initialization:
+  - **read-compose baseline** (`sys-read-compose`): pre-authorizes `read` and `compose` for all contexts. No escalation rules. This ensures the agent can always read and compose responses.
+  - **physical-requires-EAA** (`sys-physical-eaa`): covers `physical` effects but forces EAA deliberation via a `trigger-eaa` escalation rule on `effect-combination: [physical]`.
+  - **elevated-owner-only** (`sys-elevated-owner`): covers `elevated` effects, restricted to owner-only contexts (`requireOwner: true`). Has a `trust-tier-below: in-process` escalation rule so external tools always trigger EAA for elevated operations.
+
+### Phase 5e: Self-Minted Policy Proposal (`src/consent/policy-proposal.ts`)
+
+- `analyzeForPolicyProposals`: analyzes recent consent records for repeated grant patterns that suggest a standing policy would reduce friction. Algorithm: fetch granted records → group by canonicalized effect set → filter by minRepetitions threshold → build candidate policies with safety constraints → run semantic conflict detection against existing policies.
+- Safety constraints:
+  - Groups where **all** effects are high-risk (`irreversible`, `elevated`, `disclose`, `audience-expand`, `exec`, `physical`) are skipped entirely — no auto-proposal for pure high-risk sets.
+  - Mixed sets (safe + risky) get `trigger-eaa` escalation rules for each high-risk effect, ensuring EAA deliberation is always triggered.
+  - Self-minted policies always start as `pending-confirmation` — they cannot be consumed as consent anchors until a human confirms them.
+  - Maximum expiry (default 30 days) and maximum uses (default 100) enforce re-confirmation cycles.
+- `createSelfMintedPolicy`: persists a `PolicyProposal` as a `pending-confirmation` `StandingPolicy` in the policy store. Stores the policy's embedding if an embedder is provided. Rejects proposals that are not in `pending-confirmation` status.
+- `checkCOForPolicyPromotion`: evaluates whether a recently granted CO could be promoted to a standing policy. Embeds the CO's effect description in the same format as policies, searches for existing coverage via `findSimilarPolicies`. Returns `shouldPromote: false` with the matching policy when semantic overlap exists; `shouldPromote: true` when the CO represents genuinely new consent territory.
+- `HIGH_RISK_EFFECTS`: set of 6 effects requiring escalation rules in auto-proposals.
+
+### Phase 5f: Dynamic Trust Tiers (`src/consent/policy.ts`, `src/consent/binder.ts`)
+
+- `ToolSource` type: `"bundled" | "npm" | "mcp" | "unknown"` — classifies the origin of a plugin tool for trust tier derivation.
+- `deriveTrustTier(explicitTier, source)`: derives a tool's trust tier from its source when not explicitly declared. Bundled → `in-process`, npm → `sandboxed`, MCP → `external`, unknown → `sandboxed` (conservative default). Explicit declarations take precedence.
+- **External-tool policy enforcement** in `evaluatePoliciesForGrants`: when a tool's trust tier is `external`, only `system`-class policies may be consumed without a `trust-tier-below` escalation rule. Non-system policies lacking a `trust-tier-below` rule are silently skipped for external tools. This prevents broad user/self-minted policies from being silently consumed by untrusted external tools without the policy author having explicitly considered external trust risks.
+
+### Phase 5h: Configuration Surface (`src/config/types.openclaw.ts`, `src/config/zod-schema.ts`)
+
+- New `consent.policies` config section on `ConsentConfig`:
+  - `enabled` (boolean, default `false`): opt-in gate for the standing policy framework.
+  - `storePath` (string): explicit path to policy store SQLite database. Default: auto-resolved.
+  - `selfMintedMaxExpiryMs` (integer >= 0): maximum expiry for self-minted policies in ms. Default: 30 days.
+  - `selfMintedMinRepetitions` (integer >= 1): minimum CO grant repetitions before self-minted policy proposal. Default: 3.
+  - `selfMintedLookbackMs` (integer >= 0): lookback window for self-minted policy analysis in ms. Default: 7 days.
+  - `embeddingDimension` (integer >= 0): embedding dimension for semantic policy matching. 0 = disabled (deterministic-only retrieval). Default: 0.
+- Zod schema with `.strict()` validation on both the `policies` object and the parent `consent` object. All fields optional with appropriate min/type constraints.
+
+### Phase 5i: Pipeline Integration (`src/consent/integration.ts`, `src/consent/eaa-integration.ts`)
+
+- `initializeConsentForRun` now accepts an optional `policyStore` parameter. When provided:
+  - Calls `expireStalePolicies()` to sweep expired/maxUses-exceeded policies.
+  - Loads active policies via `getActivePolicies()`.
+  - Merges `DEFAULT_SYSTEM_POLICIES` with loaded policies and passes the combined set to `mintInitialWorkOrder`.
+  - Exposes `activePolicies` and `policyStore` on `ConsentRunContext` for downstream use.
+  - Policy store errors are non-fatal: logged as warnings, initialization continues with empty policies.
+- `handleConsentFailure` now implements a **policy bypass** step before consent precedent reuse and EAA evaluation:
+  - Filters applicable policies via `filterApplicablePolicies` against the current runtime context.
+  - If all missing effects are covered by applicable policies' `effectScope`, mints a successor WO with policy anchors directly — skipping CO/EAA entirely.
+  - If policy-based successor minting fails (e.g., system prohibition), falls through to the existing precedent/EAA pipeline.
+- `policies` and `systemProhibitions` are threaded through all downstream `mintSuccessorWithAnchor` calls: precedent reuse, EAA `proceed`, EAA `constrained-comply`, and EAA `emergency-act`.
+- `HandleConsentFailureParams` extended with optional `policies` and `systemProhibitions` fields.
+
+### Phase 5c–5i: Barrel Exports (`src/consent/index.ts`)
+
+- Phase 5e: `PolicyProposalParams`, `PolicyProposal`, `CheckCOPromotionParams`, `COPromotionResult`, `analyzeForPolicyProposals`, `createSelfMintedPolicy`, `checkCOForPolicyPromotion`.
+- Phase 5f: `ToolSource`, `deriveTrustTier`.
+
+### Phase 5c–5i: Tests
+
+- `src/consent/binder.test.ts`: 79 new tests in Phase 5c/5d/5f blocks — dual-path policy evaluation (deterministic path grants, semantic path grants, merge/dedup, class precedence ordering, escalation rule skipping, status/expiry filtering, policy anchor recording, backward compat with empty policies, stub filtering), default system policies in binder (baseline read/compose granting, physical-EAA escalation, elevated-owner restriction), external-tool enforcement (system policy exemption, user policy without trust-tier rule blocked, user policy with trust-tier rule consumed), successor WO policy evaluation.
+- `src/consent/policy.test.ts`: 5 new tests — `deriveTrustTier` explicit tiers, bundled/npm/mcp/unknown derivation.
+- `src/consent/policy-proposal.test.ts`: 24 tests — `groupByEffectSet` (grouping, cutoff, empty effects), `buildProposalDescription` (safe/risky), `buildRationale` (with/without overlaps), `analyzeForPolicyProposals` (repetition threshold, minRepetitions gate, all-high-risk skip, mixed-set escalation rules, channel scoping, custom expiry/uses, semantic overlap, no-embedder fallback, multiple groups), `createSelfMintedPolicy` (persistence, embedding storage, status guard), `checkCOForPolicyPromotion` (promote when no match, block when match exists, custom threshold), `HIGH_RISK_EFFECTS` constant verification.
+- `src/consent/integration.test.ts`: 4 new tests — policy-loaded initialization (active policies passed to binder, no-store backward compat, stale policy expiry, store error graceful handling).
+- Full consent test suite: **557 passing, 16 skipped** (skipped require sqlite-vec native extension).
+
+---
+
 ## 0.8.0 — 2026-04-02
 
 Phase 5a/5b: Standing policy type system, persistence store with vector similarity.

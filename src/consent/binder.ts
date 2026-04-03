@@ -21,6 +21,9 @@ import {
   timingSafeEqual as cryptoTimingSafeEqual,
 } from "node:crypto";
 import { getToolEffectProfile } from "./effect-registry.js";
+import type { PolicyStore } from "./policy-store.js";
+import { evaluateEscalationRules, filterApplicablePolicies, isExpired } from "./policy.js";
+import type { EscalationContext, PolicyMatchContext, StandingPolicy } from "./policy.js";
 import type {
   BinderMintInput,
   BinderRequalifyInput,
@@ -29,6 +32,7 @@ import type {
   ConsentRecord,
   EAARecord,
   EffectClass,
+  StandingPolicyStub,
   ToolEffectProfile,
   WOConstraint,
   WODecodeResult,
@@ -38,21 +42,65 @@ import type {
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
+// Phase 5c: Policy Embedder Type
+// ---------------------------------------------------------------------------
+
+/**
+ * Async function that converts text into a vector embedding.
+ * The binder itself is synchronous; the caller invokes the embedder
+ * and passes pre-resolved semantic candidates via `semanticPolicyCandidates`.
+ */
+export type PolicyEmbedder = (text: string) => Promise<Float32Array>;
+
+// ---------------------------------------------------------------------------
 // WO Minting: Initial (from PO + implied consent)
 // ---------------------------------------------------------------------------
 
 /**
  * Mint the initial Work Order for a new request. The grants are derived from
- * the intersection of (PO implied effects) and (system-allowed effects).
- * Standing policies in the "system" class can further restrict.
+ * the intersection of (PO implied effects) and (system-allowed effects),
+ * augmented by applicable standing policies (Phase 5c).
+ *
+ * Policy application order: system prohibitions first, then system policies
+ * (restrictions/grants), user policies, self-minted policies. Escalation
+ * rules can override a policy's grant at evaluation time.
  */
 export function mintInitialWorkOrder(input: BinderMintInput): BinderResult {
   const { po, systemProhibitions } = input;
-  // Standing policies are accepted in the interface for forward compatibility
-  // with Phase 5 but are not enforced in this phase.
 
   const prohibited = new Set<EffectClass>(systemProhibitions);
-  const granted = po.impliedEffects.filter((e) => !prohibited.has(e));
+  const implied = po.impliedEffects.filter((e) => !prohibited.has(e));
+
+  // Phase 5c: resolve applicable policies via dual-path retrieval
+  const matchContext: PolicyMatchContext = {
+    channel: po.channel,
+    chatType: po.chatType,
+    senderId: po.senderId,
+    senderIsOwner: po.senderIsOwner,
+  };
+
+  const escalationCtx: EscalationContext = {
+    toolName: "",
+    toolProfile: { effects: [...po.impliedEffects], trustTier: "in-process" },
+    po: {
+      senderId: po.senderId,
+      senderIsOwner: po.senderIsOwner,
+      channel: po.channel,
+      chatType: po.chatType,
+    },
+    recentInvocationCount: 0,
+  };
+
+  const { policyGrantedEffects, policyAnchors } = evaluatePoliciesForGrants({
+    policies: input.policies,
+    semanticCandidates: input.semanticPolicyCandidates,
+    matchContext,
+    escalationCtx,
+    prohibited,
+    existingGrants: new Set(implied),
+  });
+
+  const granted = [...new Set([...implied, ...policyGrantedEffects])];
 
   if (granted.length === 0) {
     return {
@@ -64,13 +112,14 @@ export function mintInitialWorkOrder(input: BinderMintInput): BinderResult {
 
   const now = nowMs();
   const expiresAt = now + DEFAULT_WO_TTL_MS;
+  const anchors: ConsentAnchor[] = [{ kind: "implied", poId: po.id }, ...policyAnchors];
 
   const wo = sealWorkOrder({
     id: generateId(),
     requestContextId: po.id,
     grantedEffects: granted,
     constraints: [{ kind: "time-bound", expiresAt }],
-    consentAnchors: [{ kind: "implied", poId: po.id }],
+    consentAnchors: anchors,
     mintedAt: now,
     expiresAt,
     immutable: true,
@@ -101,7 +150,6 @@ export function mintSuccessorWorkOrder(input: BinderRequalifyInput): BinderResul
     stepEffectProfile,
     newAnchors,
     additionalEffects,
-    // Standing policies accepted for forward compatibility with Phase 5.
     systemProhibitions,
     constraints,
   } = input;
@@ -159,6 +207,48 @@ export function mintSuccessorWorkOrder(input: BinderRequalifyInput): BinderResul
     combinedEffects.delete(effect);
   }
 
+  // Phase 5c: evaluate standing policies for additional grants during requalification
+  const policyAnchors: ConsentAnchor[] = [];
+  if (
+    input.policies.length > 0 ||
+    (input.semanticPolicyCandidates && input.semanticPolicyCandidates.length > 0)
+  ) {
+    const matchContext: PolicyMatchContext = {
+      channel: po.channel,
+      chatType: po.chatType,
+      senderId: po.senderId,
+      senderIsOwner: po.senderIsOwner,
+      toolName: input.toolName,
+      toolTrustTier: stepEffectProfile.trustTier,
+    };
+
+    const escalationCtx: EscalationContext = {
+      toolName: input.toolName ?? "",
+      toolProfile: stepEffectProfile,
+      po: {
+        senderId: po.senderId,
+        senderIsOwner: po.senderIsOwner,
+        channel: po.channel,
+        chatType: po.chatType,
+      },
+      recentInvocationCount: 0,
+    };
+
+    const result = evaluatePoliciesForGrants({
+      policies: input.policies,
+      semanticCandidates: input.semanticPolicyCandidates,
+      matchContext,
+      escalationCtx,
+      prohibited,
+      existingGrants: combinedEffects,
+    });
+
+    for (const effect of result.policyGrantedEffects) {
+      combinedEffects.add(effect);
+    }
+    policyAnchors.push(...result.policyAnchors);
+  }
+
   // Ceiling check: bound by step's declared effect profile
   const stepCeiling = new Set<EffectClass>(stepEffectProfile.effects);
   const granted = [...combinedEffects].filter((e) => stepCeiling.has(e));
@@ -173,7 +263,7 @@ export function mintSuccessorWorkOrder(input: BinderRequalifyInput): BinderResul
     };
   }
 
-  const allAnchors = [...currentWO.consentAnchors, ...newAnchors];
+  const allAnchors = [...currentWO.consentAnchors, ...newAnchors, ...policyAnchors];
   const expiresAt = now + DEFAULT_WO_TTL_MS;
   const allConstraints: WOConstraint[] = [
     ...(constraints ?? []),
@@ -195,6 +285,118 @@ export function mintSuccessorWorkOrder(input: BinderRequalifyInput): BinderResul
   });
 
   return { ok: true, wo };
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5c: Policy Evaluation (Dual-Path Retrieval)
+// ---------------------------------------------------------------------------
+
+type PolicyEvalInput = {
+  policies: readonly (StandingPolicyStub | StandingPolicy)[];
+  semanticCandidates?: readonly StandingPolicy[];
+  matchContext: PolicyMatchContext;
+  escalationCtx: EscalationContext;
+  prohibited: Set<EffectClass>;
+  existingGrants: Set<EffectClass>;
+};
+
+type PolicyEvalResult = {
+  policyGrantedEffects: EffectClass[];
+  policyAnchors: ConsentAnchor[];
+};
+
+/**
+ * Evaluate standing policies and produce additional grants + consent anchors.
+ *
+ * Dual-path: the deterministic path runs `filterApplicablePolicies` over the
+ * full policies array; the semantic path accepts pre-resolved candidates
+ * (from embedding search) and validates them through the same gauntlet.
+ *
+ * Application order (precedence):
+ *   1. System policies — grants/restrictions
+ *   2. User policies — expand grant set
+ *   3. Self-minted policies — expand grant set (only if confirmed/active)
+ *
+ * Escalation rules on any policy can suppress that policy's grants.
+ */
+function evaluatePoliciesForGrants(input: PolicyEvalInput): PolicyEvalResult {
+  const { policies, semanticCandidates, matchContext, escalationCtx, prohibited, existingGrants } =
+    input;
+
+  // --- Deterministic path ---
+  const deterministicPolicies = filterApplicablePolicies(policies, matchContext);
+
+  // --- Semantic path: validate each candidate through the full deterministic gauntlet ---
+  // Reuse filterApplicablePolicies to ensure applicability, status, and expiry checks
+  // are identical for both paths (no validation gap).
+  const validatedSemantic = semanticCandidates
+    ? filterApplicablePolicies(semanticCandidates, matchContext)
+    : [];
+
+  // --- Merge: union of deterministic + validated semantic, dedup by id ---
+  const seenIds = new Set<string>();
+  const merged: StandingPolicy[] = [];
+  for (const p of [...deterministicPolicies, ...validatedSemantic]) {
+    if (!seenIds.has(p.id)) {
+      seenIds.add(p.id);
+      merged.push(p);
+    }
+  }
+
+  // Sort by precedence: system → user → self-minted
+  const classOrder: Record<string, number> = { system: 0, user: 1, "self-minted": 2 };
+  merged.sort((a, b) => (classOrder[a.class] ?? 9) - (classOrder[b.class] ?? 9));
+
+  const grantedEffects: EffectClass[] = [];
+  const anchors: ConsentAnchor[] = [];
+
+  for (const policy of merged) {
+    // System policies can restrict (handled via systemProhibitions) or grant
+    // User / self-minted policies expand the grant set
+    if (policy.status !== "active") {
+      continue;
+    }
+    if (isExpired(policy.expiry)) {
+      continue;
+    }
+
+    // Evaluate escalation rules: if any fires, skip this policy's grants
+    const escalated = evaluateEscalationRules(policy.escalationRules, escalationCtx);
+    if (escalated) {
+      continue;
+    }
+
+    // Phase 5f: external tools may only consume policies that carry a
+    // trust-tier-aware escalation rule. This prevents external tools from
+    // silently consuming broad user/self-minted policies without the policy
+    // author having explicitly considered external trust tier risks.
+    const toolTier = escalationCtx.toolProfile.trustTier ?? "in-process";
+    if (toolTier === "external" && policy.class !== "system") {
+      const hasTrustTierRule = policy.escalationRules.some(
+        (r) => r.condition.kind === "trust-tier-below",
+      );
+      if (!hasTrustTierRule) {
+        continue;
+      }
+    }
+
+    let addedNewEffect = false;
+    for (const effect of policy.effectScope) {
+      if (!prohibited.has(effect) && !existingGrants.has(effect)) {
+        grantedEffects.push(effect);
+        existingGrants.add(effect);
+        addedNewEffect = true;
+      }
+    }
+
+    // Only record anchor if the policy actually contributed a grant
+    // or if it covers effects already in the grant set (validation anchor)
+    if (addedNewEffect || policy.effectScope.some((e) => existingGrants.has(e))) {
+      anchors.push({ kind: "policy", policyId: policy.id });
+    }
+  }
+
+  return { policyGrantedEffects: grantedEffects, policyAnchors: anchors };
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +508,7 @@ function validateConsentAnchor(
 }
 
 /**
- * Verify a consent anchor against actual consent/EAA records.
+ * Verify a consent anchor against actual consent/EAA records and policy store.
  * Returns false if the referenced record is missing, denied, expired, or
  * doesn't cover the needed effect classes.
  */
@@ -315,6 +517,7 @@ export function verifyConsentAnchorAgainstRecords(
   neededEffects: EffectClass[],
   consentRecords: readonly ConsentRecord[],
   eaaRecords: readonly EAARecord[],
+  policyStore?: PolicyStore,
 ): { valid: true } | { valid: false; reason: string } {
   switch (anchor.kind) {
     case "implied":
@@ -361,9 +564,32 @@ export function verifyConsentAnchorAgainstRecords(
       return { valid: true };
     }
 
-    case "policy":
-      // Policy validation is Phase 5; accept structurally valid anchors for now
+    case "policy": {
+      // Phase 5c: verify the referenced policy exists, is active, and covers needed effects
+      if (!policyStore) {
+        return { valid: true };
+      }
+
+      const policy = policyStore.getPolicy(anchor.policyId);
+      if (!policy) {
+        return { valid: false, reason: `Policy ${anchor.policyId} not found` };
+      }
+      if (policy.status !== "active") {
+        return { valid: false, reason: `Policy ${anchor.policyId} is ${policy.status}` };
+      }
+      if (isExpired(policy.expiry)) {
+        return { valid: false, reason: `Policy ${anchor.policyId} has expired` };
+      }
+      const policyEffects = new Set(policy.effectScope);
+      const uncovered = neededEffects.filter((e) => !policyEffects.has(e));
+      if (uncovered.length > 0) {
+        return {
+          valid: false,
+          reason: `Policy does not cover effects: [${uncovered.join(", ")}]`,
+        };
+      }
       return { valid: true };
+    }
 
     default:
       return { valid: false, reason: "Unknown consent anchor kind" };

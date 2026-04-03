@@ -974,6 +974,17 @@ export const OpenClawSchema = z
           })
           .strict()
           .optional(),
+        policies: z
+          .object({
+            enabled: z.boolean().optional(),
+            storePath: z.string().optional(),
+            selfMintedMaxExpiryMs: z.number().int().min(0).optional(),
+            selfMintedMinRepetitions: z.number().int().min(1).optional(),
+            selfMintedLookbackMs: z.number().int().min(0).optional(),
+            embeddingDimension: z.number().int().min(0).optional(),
+          })
+          .strict()
+          .optional(),
       })
       .strict()
       .optional(),

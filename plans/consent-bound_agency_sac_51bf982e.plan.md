@@ -43,25 +43,25 @@ todos:
     status: completed
   - id: phase-5c-binder
     content: "Binder policy evaluation with dual-path retrieval: deterministic path (filterApplicablePolicies) + semantic path (embed context → findSimilarPolicies → validate candidates), PolicyEmbedder type, merge/dedup by policy id, policy application order (system → user → self-minted), escalation rule evaluation, policy anchor verification, backward compat when embeddings disabled"
-    status: pending
+    status: completed
   - id: phase-5d-defaults
     content: "Default system policies: read/compose baseline, physical-EAA escalation, elevated-owner restriction. Loaded at startup alongside DEFAULT_DUTY_CONSTRAINTS."
-    status: pending
+    status: completed
   - id: phase-5e-proposal
     content: "Self-minted policy proposal with semantic conflict detection: consent record pattern analysis, repetition detection, high-risk safety constraints, pending-confirmation lifecycle, user confirmation prompt, semantic overlap check via findSimilarPolicies before proposing, CO-to-policy promotion via checkCOForPolicyPromotion"
-    status: pending
+    status: completed
   - id: phase-5f-trust
     content: "Dynamic trust tiers for plugin tools: manifest declaration, derived tier from plugin source (bundled/npm/MCP), trust-tier impact on policy acceptance and EAA thresholds"
-    status: pending
+    status: completed
   - id: phase-5g-pattern
     content: "ABSORBED into Phases 5b/5c/5e: policy embedding, semantic search, conflict detection, and CO-to-policy promotion are now first-class capabilities in the policy store (5b), binder dual-path retrieval (5c), and proposal flow (5e)"
     status: cancelled
   - id: phase-5h-config
     content: "Configuration surface: consent.policies config section (enabled, storePath, selfMintedMaxExpiryMs, selfMintedMinRepetitions, embeddingDimension), Zod schema, config baseline regeneration"
-    status: pending
+    status: completed
   - id: phase-5i-integration
     content: "Pipeline integration: policy-loaded initializeConsentForRun, policy bypass in handleConsentFailure, policies passed to mintSuccessorWithAnchor, index.ts barrel update"
-    status: pending
+    status: completed
   - id: phase-6-observability
     content: Scope chain event model, action receipts (confirmation/receipt/report), gateway protocol extensions for consent methods, metrics tracking
     status: pending

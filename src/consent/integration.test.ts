@@ -498,3 +498,114 @@ describe("end-to-end consent flow", () => {
     expect(result.allowed).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Phase 5i: Policy-loaded initialization
+// ---------------------------------------------------------------------------
+
+describe("initializeConsentForRun with policy store (5i)", () => {
+  it("loads active policies from store and passes them to binder", async () => {
+    setupDeterministicBinder();
+
+    const mockPolicyStore = {
+      expireStalePolicies: () => 0,
+      getActivePolicies: () => [
+        {
+          id: "user-pol-persist",
+          class: "user" as const,
+          effectScope: ["persist"] as const,
+          applicability: {},
+          escalationRules: [],
+          expiry: { currentUses: 0 },
+          revocationSemantics: "immediate" as const,
+          provenance: { author: "user:test", createdAt: FIXED_TIME },
+          description: "Allow persist",
+          status: "active" as const,
+        },
+      ],
+    };
+
+    const ctx = await initializeConsentForRun({
+      requestText: "save a file",
+      senderId: "user-1",
+      senderIsOwner: true,
+      impliedEffects: ["read", "compose"],
+      env: {},
+      policyStore: mockPolicyStore as never,
+    });
+
+    expect(ctx).toBeDefined();
+    // System policy grants read+compose; user policy adds persist
+    expect(ctx!.wo.grantedEffects).toContain("read");
+    expect(ctx!.wo.grantedEffects).toContain("compose");
+    expect(ctx!.wo.grantedEffects).toContain("persist");
+    expect(ctx!.activePolicies.length).toBeGreaterThan(0);
+    expect(ctx!.policyStore).toBeDefined();
+  });
+
+  it("returns activePolicies=[] and no policyStore when no store is provided", async () => {
+    setupDeterministicBinder();
+
+    const ctx = await initializeConsentForRun({
+      requestText: "test",
+      senderId: "user-1",
+      senderIsOwner: true,
+      impliedEffects: ["read", "compose"],
+      env: {},
+    });
+
+    expect(ctx).toBeDefined();
+    expect(ctx!.activePolicies).toEqual([]);
+    expect(ctx!.policyStore).toBeUndefined();
+    // No system policies loaded → exactly the implied effects
+    expect(ctx!.wo.grantedEffects).toEqual(["read", "compose"]);
+  });
+
+  it("expires stale policies before loading", async () => {
+    setupDeterministicBinder();
+    let expiredCalled = false;
+
+    const mockPolicyStore = {
+      expireStalePolicies: () => {
+        expiredCalled = true;
+        return 2;
+      },
+      getActivePolicies: () => [],
+    };
+
+    await initializeConsentForRun({
+      requestText: "test",
+      senderId: "user-1",
+      senderIsOwner: true,
+      impliedEffects: ["read"],
+      env: {},
+      policyStore: mockPolicyStore as never,
+    });
+
+    expect(expiredCalled).toBe(true);
+  });
+
+  it("handles policy store errors gracefully", async () => {
+    setupDeterministicBinder();
+
+    const mockPolicyStore = {
+      expireStalePolicies: () => {
+        throw new Error("DB connection failed");
+      },
+      getActivePolicies: () => [],
+    };
+
+    const ctx = await initializeConsentForRun({
+      requestText: "test",
+      senderId: "user-1",
+      senderIsOwner: true,
+      impliedEffects: ["read", "compose"],
+      env: {},
+      policyStore: mockPolicyStore as never,
+    });
+
+    // Should still succeed — policy loading errors are non-fatal
+    expect(ctx).toBeDefined();
+    expect(ctx!.wo.grantedEffects).toEqual(["read", "compose"]);
+  });
+});

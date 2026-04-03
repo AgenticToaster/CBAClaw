@@ -38,8 +38,10 @@ import type {
 } from "./eaa.js";
 import { runElevatedActionAnalysis } from "./eaa.js";
 import type { ConsentPatternStore } from "./implied-consent-store.js";
+import { filterApplicablePolicies } from "./policy.js";
 import { addEAARecord, transitionWorkOrder } from "./scope-chain.js";
 import type {
+  BinderPolicy,
   ChangeOrder,
   ConsentAnchor,
   ConsentRecord,
@@ -47,6 +49,7 @@ import type {
   EAARecord,
   EffectClass,
   PurchaseOrder,
+  StandingPolicyStub,
   ToolEffectProfile,
   WOConstraint,
   WorkOrder,
@@ -85,6 +88,10 @@ export type HandleConsentFailureParams = {
   consentRecordStore?: ConsentRecordStore;
   /** LLM inference function for EAA Step 3. When absent, EAA falls back to refuse. */
   infer?: EAAInferenceFn;
+  /** Active standing policies for the binder (Phase 5i). */
+  policies?: readonly (StandingPolicyStub | BinderPolicy)[];
+  /** System-level prohibited effects. */
+  systemProhibitions?: EffectClass[];
 };
 
 // ---------------------------------------------------------------------------
@@ -118,7 +125,58 @@ export async function handleConsentFailure(
     patternStore,
     consentRecordStore,
     infer,
+    policies = [],
+    systemProhibitions = [],
   } = params;
+
+  // Phase 5i: check if active standing policies cover the missing effects
+  if (policies.length > 0) {
+    const matchContext = {
+      channel: po.channel,
+      chatType: po.chatType,
+      senderId: po.senderId,
+      senderIsOwner: po.senderIsOwner,
+      toolName,
+      toolTrustTier: toolProfile.trustTier,
+    };
+    const applicable = filterApplicablePolicies(policies, matchContext);
+    const policyCoveredEffects = new Set(applicable.flatMap((p) => p.effectScope));
+    const allCovered = missingEffects.every((e) => policyCoveredEffects.has(e));
+
+    if (allCovered) {
+      log.debug(
+        `policy bypass: missing effects [${missingEffects.join(",")}] covered by ` +
+          `${applicable.length} active policies`,
+      );
+      const policyAnchors: ConsentAnchor[] = applicable.map((p) => ({
+        kind: "policy" as const,
+        policyId: p.id,
+      }));
+      const successorResult = mintSuccessorWorkOrder({
+        currentWO: activeWO,
+        po,
+        stepEffectProfile: toolProfile,
+        newAnchors: policyAnchors,
+        additionalEffects: missingEffects,
+        policies,
+        systemProhibitions,
+        toolName,
+      });
+      if (successorResult.ok) {
+        transitionWorkOrder(successorResult.wo);
+        return {
+          action: "eaa-resolved",
+          outcome: "proceed",
+          successorWO: successorResult.wo,
+          explanation: `Policy bypass: effects covered by standing policies [${applicable.map((p) => p.id).join(", ")}]`,
+        };
+      }
+      log.debug(
+        `policy-based successor WO refused: ${successorResult.reason}; ` +
+          "falling through to precedent/EAA",
+      );
+    }
+  }
 
   // Step 1: Consent precedent reuse (Phase 3c)
   if (consentRecordStore) {
@@ -134,6 +192,8 @@ export async function handleConsentFailure(
         toolProfile,
         additionalEffects: missingEffects,
         anchor: { kind: "explicit", consentRecordId: precedent.id },
+        policies,
+        systemProhibitions,
       });
       if (successorResult.ok) {
         transitionWorkOrder(successorResult.wo);
@@ -224,6 +284,8 @@ export async function handleConsentFailure(
     missingEffects,
     patternStore,
     ambiguity,
+    policies,
+    systemProhibitions,
   });
 }
 
@@ -241,6 +303,8 @@ type ProcessEAAOutcomeParams = {
   missingEffects: EffectClass[];
   patternStore?: ConsentPatternStore;
   ambiguity?: AmbiguityAssessment;
+  policies?: readonly (StandingPolicyStub | BinderPolicy)[];
+  systemProhibitions?: EffectClass[];
 };
 
 function processEAAOutcome(params: ProcessEAAOutcomeParams): ConsentFailureResolution {
@@ -253,6 +317,8 @@ function processEAAOutcome(params: ProcessEAAOutcomeParams): ConsentFailureResol
     missingEffects,
     patternStore,
     ambiguity,
+    policies = [],
+    systemProhibitions = [],
   } = params;
   const { adjudication, reasoning, eaaRecord } = eaaResult;
   const outcome = adjudication.outcome;
@@ -265,6 +331,8 @@ function processEAAOutcome(params: ProcessEAAOutcomeParams): ConsentFailureResol
         toolProfile,
         additionalEffects: adjudication.recommendedEffects,
         anchor: { kind: "eaa", eaaRecordId: eaaRecord.id },
+        policies,
+        systemProhibitions,
       });
       if (!result.ok) {
         log.warn(`proceed: successor WO refused by binder: ${result.reason}`);
@@ -314,6 +382,8 @@ function processEAAOutcome(params: ProcessEAAOutcomeParams): ConsentFailureResol
         additionalEffects: adjudication.recommendedEffects,
         anchor: { kind: "eaa", eaaRecordId: eaaRecord.id },
         constraints,
+        policies,
+        systemProhibitions,
       });
       if (!result.ok) {
         log.warn(`constrained-comply: successor WO refused by binder: ${result.reason}`);
@@ -342,6 +412,8 @@ function processEAAOutcome(params: ProcessEAAOutcomeParams): ConsentFailureResol
         additionalEffects: adjudication.recommendedEffects,
         anchor: { kind: "eaa", eaaRecordId: eaaRecord.id },
         constraints,
+        policies,
+        systemProhibitions,
       });
       if (!result.ok) {
         log.warn(`emergency-act: successor WO refused by binder: ${result.reason}`);
@@ -422,6 +494,9 @@ type MintSuccessorParams = {
   additionalEffects: EffectClass[];
   anchor: ConsentAnchor;
   constraints?: WOConstraint[];
+  /** Standing policies for the binder (Phase 5i). */
+  policies?: readonly (StandingPolicyStub | BinderPolicy)[];
+  systemProhibitions?: EffectClass[];
 };
 
 function mintSuccessorWithAnchor(params: MintSuccessorParams) {
@@ -431,8 +506,8 @@ function mintSuccessorWithAnchor(params: MintSuccessorParams) {
     stepEffectProfile: params.toolProfile,
     newAnchors: [params.anchor],
     additionalEffects: params.additionalEffects,
-    policies: [],
-    systemProhibitions: [],
+    policies: params.policies ?? [],
+    systemProhibitions: params.systemProhibitions ?? [],
     constraints: params.constraints,
   });
 }

@@ -3,11 +3,13 @@ import {
   buildContextEmbeddingText,
   buildPolicyEmbeddingText,
   DEFAULT_SYSTEM_POLICIES,
+  deriveTrustTier,
   evaluateEscalationRules,
   filterApplicablePolicies,
   isExpired,
   isFullStandingPolicy,
   meetsTrustTier,
+  recordAndCheckUsage,
   __testing,
   type EscalationContext,
   type EscalationRule,
@@ -1035,5 +1037,103 @@ describe("buildContextEmbeddingText", () => {
     // Both should have the same [effects: ...] prefix format
     expect(policyText.startsWith("[effects: read, persist]")).toBe(true);
     expect(contextText.startsWith("[effects: read, persist]")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// recordAndCheckUsage
+// ---------------------------------------------------------------------------
+
+describe("recordAndCheckUsage", () => {
+  function makeStore(counts: Record<string, number> = {}) {
+    const recorded: { policyId: string; woId: string }[] = [];
+    return {
+      store: {
+        recordPolicyUsage(policyId: string, woId: string) {
+          recorded.push({ policyId, woId });
+          counts[policyId] = (counts[policyId] ?? 0) + 1;
+        },
+        getPolicyUsageCount(policyId: string) {
+          return counts[policyId] ?? 0;
+        },
+      },
+      recorded,
+    };
+  }
+
+  it("returns true when no maxUses is set", () => {
+    const { store } = makeStore();
+    const policy = createTestPolicy({
+      id: "pol-unlimited",
+      expiry: { currentUses: 0 },
+    });
+
+    const result = recordAndCheckUsage(policy, "wo-1", store);
+    expect(result).toBe(true);
+  });
+
+  it("returns true when usage count is within maxUses", () => {
+    const { store } = makeStore({ "pol-limited": 2 });
+    const policy = createTestPolicy({
+      id: "pol-limited",
+      expiry: { maxUses: 5, currentUses: 2 },
+    });
+
+    const result = recordAndCheckUsage(policy, "wo-1", store);
+    expect(result).toBe(true);
+  });
+
+  it("returns false when usage count exceeds maxUses", () => {
+    const { store } = makeStore({ "pol-exhausted": 4 });
+    const policy = createTestPolicy({
+      id: "pol-exhausted",
+      expiry: { maxUses: 5, currentUses: 4 },
+    });
+
+    const result = recordAndCheckUsage(policy, "wo-1", store);
+    // After recording, count is 5. maxUses is 5. 5 <= 5 is true.
+    expect(result).toBe(true);
+
+    // One more use puts it over
+    const result2 = recordAndCheckUsage(policy, "wo-2", store);
+    // After recording, count is 6. maxUses is 5. 6 <= 5 is false.
+    expect(result2).toBe(false);
+  });
+
+  it("records the policy-WO association in the store", () => {
+    const { store, recorded } = makeStore();
+    const policy = createTestPolicy({ id: "pol-track" });
+
+    recordAndCheckUsage(policy, "wo-abc", store);
+
+    expect(recorded).toEqual([{ policyId: "pol-track", woId: "wo-abc" }]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deriveTrustTier (Phase 5f)
+// ---------------------------------------------------------------------------
+
+describe("deriveTrustTier", () => {
+  it("returns explicit tier when provided", () => {
+    expect(deriveTrustTier("external", "bundled")).toBe("external");
+    expect(deriveTrustTier("in-process", "mcp")).toBe("in-process");
+    expect(deriveTrustTier("sandboxed", "npm")).toBe("sandboxed");
+  });
+
+  it("derives in-process for bundled source", () => {
+    expect(deriveTrustTier(undefined, "bundled")).toBe("in-process");
+  });
+
+  it("derives sandboxed for npm source", () => {
+    expect(deriveTrustTier(undefined, "npm")).toBe("sandboxed");
+  });
+
+  it("derives external for mcp source", () => {
+    expect(deriveTrustTier(undefined, "mcp")).toBe("external");
+  });
+
+  it("derives sandboxed for unknown source (conservative default)", () => {
+    expect(deriveTrustTier(undefined, "unknown")).toBe("sandboxed");
   });
 });

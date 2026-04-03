@@ -434,6 +434,34 @@ export const DEFAULT_SYSTEM_POLICIES: readonly StandingPolicy[] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Policy Usage Tracking
+// ---------------------------------------------------------------------------
+
+/**
+ * Record that a policy was used as a consent anchor for a given WO,
+ * then check whether the policy has exceeded its maxUses limit.
+ * Returns true if the policy is still valid (usage within limits).
+ *
+ * This is a convenience wrapper used by the binder after granting
+ * policy-anchored effects, ensuring the usage table stays in sync
+ * with the WO chain.
+ */
+export function recordAndCheckUsage(
+  policy: StandingPolicy,
+  woId: string,
+  store: {
+    recordPolicyUsage(policyId: string, woId: string): void;
+    getPolicyUsageCount(policyId: string): number;
+  },
+): boolean {
+  store.recordPolicyUsage(policy.id, woId);
+  if (policy.expiry.maxUses === undefined) {
+    return true;
+  }
+  return store.getPolicyUsageCount(policy.id) <= policy.expiry.maxUses;
+}
+
+// ---------------------------------------------------------------------------
 // Embedding Text Construction
 // ---------------------------------------------------------------------------
 
@@ -480,6 +508,44 @@ export function buildContextEmbeddingText(params: {
   }
 
   return parts.join(" ");
+}
+
+// ---------------------------------------------------------------------------
+// Trust Tier Derivation (Phase 5f)
+// ---------------------------------------------------------------------------
+
+/** Source/origin of a plugin tool for trust tier derivation. */
+export type ToolSource = "bundled" | "npm" | "mcp" | "unknown";
+
+/**
+ * Derive a tool's trust tier from its source when not explicitly declared.
+ *
+ * Derivation rules:
+ *   - Bundled workspace plugins → "in-process" (first-party, reviewed)
+ *   - Installed npm plugins     → "sandboxed" (third-party, isolated)
+ *   - MCP transport tools       → "external" (remote, untrusted)
+ *   - Unknown source            → "sandboxed" (conservative default)
+ *
+ * When a tool explicitly declares a trustTier in its ToolEffectProfile,
+ * the declared value takes precedence over derivation.
+ */
+export function deriveTrustTier(
+  explicitTier: TrustTier | undefined,
+  source: ToolSource,
+): TrustTier {
+  if (explicitTier) {
+    return explicitTier;
+  }
+  switch (source) {
+    case "bundled":
+      return "in-process";
+    case "npm":
+      return "sandboxed";
+    case "mcp":
+      return "external";
+    case "unknown":
+      return "sandboxed";
+  }
 }
 
 // ---------------------------------------------------------------------------
