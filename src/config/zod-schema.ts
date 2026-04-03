@@ -960,6 +960,23 @@ export const OpenClawSchema = z
       })
       .strict()
       .optional(),
+    consent: z
+      .object({
+        impliedEffects: z
+          .object({
+            provider: z.string().optional(),
+            model: z.string().optional(),
+            threshold: z.number().min(0).max(2).optional(),
+            topK: z.number().int().min(1).optional(),
+            mode: z
+              .union([z.literal("vector"), z.literal("heuristic"), z.literal("both")])
+              .optional(),
+          })
+          .strict()
+          .optional(),
+      })
+      .strict()
+      .optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {

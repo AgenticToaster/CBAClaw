@@ -122,6 +122,22 @@ export type OpenClawConfig = {
   gateway?: GatewayConfig;
   memory?: MemoryConfig;
   mcp?: McpConfig;
+  consent?: ConsentConfig;
+};
+
+export type ConsentConfig = {
+  impliedEffects?: {
+    /** Embedding provider ID for pattern matching. Default: "auto". */
+    provider?: string;
+    /** Embedding model override. */
+    model?: string;
+    /** Cosine distance threshold for pattern matching. Default: 0.35. */
+    threshold?: number;
+    /** Number of similar patterns to consider. Default: 5. */
+    topK?: number;
+    /** Derivation mode: "vector", "heuristic", or "both". Default: "both". */
+    mode?: "vector" | "heuristic" | "both";
+  };
 };
 
 declare const openClawConfigStateBrand: unique symbol;

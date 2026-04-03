@@ -45,6 +45,20 @@ export function withConsentScope<T>(state: ConsentScopeState, run: () => T): T {
 }
 
 /**
+ * Bind a consent scope to the current async execution context using
+ * AsyncLocalStorage.enterWith(). Unlike withConsentScope(), this does
+ * not require restructuring the caller into a callback -- the scope
+ * persists for the lifetime of the current async context and all its
+ * async descendants.
+ *
+ * Use this in long-lived entry points (e.g., runEmbeddedAttempt) where
+ * wrapping the entire body in a callback is impractical.
+ */
+export function enterConsentScope(state: ConsentScopeState): void {
+  consentScope.enterWith(state);
+}
+
+/**
  * Return the current consent scope state, or undefined if not inside
  * a consent-scoped execution context.
  */

@@ -9,6 +9,8 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { resolveHeartbeatPrompt } from "../../../auto-reply/heartbeat.js";
 import { resolveChannelCapabilities } from "../../../config/channel-capabilities.js";
+import { initializeConsentForRun } from "../../../consent/integration.js";
+import { enterConsentScope } from "../../../consent/scope-chain.js";
 import { getMachineDisplayName } from "../../../infra/machine-name.js";
 import {
   ensureGlobalUndiciEnvProxyDispatcher,
@@ -409,6 +411,22 @@ export async function runEmbeddedAttempt(
       config: params.config,
       agentId: params.agentId,
     });
+
+    // CBA: Initialize consent scope for this agent run. Derives implied
+    // effects from request text (vector + heuristic), creates a PO, mints
+    // an initial WO, and binds the consent scope via AsyncLocalStorage.
+    const consentCtx = await initializeConsentForRun({
+      requestText: params.prompt,
+      senderId: params.senderId ?? "unknown",
+      senderIsOwner: params.senderIsOwner ?? false,
+      channel: params.messageChannel ?? params.messageProvider,
+      sessionKey: sandboxSessionKey,
+      agentId: sessionAgentId,
+    });
+    if (consentCtx) {
+      enterConsentScope(consentCtx.scopeState);
+    }
+
     const effectiveFsWorkspaceOnly = resolveAttemptFsWorkspaceOnly({
       config: params.config,
       sessionAgentId,

@@ -150,6 +150,9 @@ export type OpenClawPluginToolOptions = {
   name?: string;
   names?: string[];
   optional?: boolean;
+  /** Consent-Bound Agency effect profile for this tool. When set, the binder
+   *  uses this for ceiling checks instead of the core effect registry default. */
+  effectProfile?: import("../consent/types.js").ToolEffectProfile;
 };
 
 export type OpenClawPluginHookOptions = {

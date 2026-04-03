@@ -55,6 +55,7 @@ import type {
   OpenClawPluginService,
   OpenClawPluginToolContext,
   OpenClawPluginToolFactory,
+  OpenClawPluginToolOptions,
   PluginConfigUiHint,
   PluginDiagnostic,
   PluginBundleFormat,
@@ -78,6 +79,8 @@ export type PluginToolRegistration = {
   optional: boolean;
   source: string;
   rootDir?: string;
+  /** CBA effect profile declared by the plugin via registerTool options. */
+  effectProfile?: import("../consent/types.js").ToolEffectProfile;
 };
 
 export type PluginCliRegistration = {
@@ -291,7 +294,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
   const registerTool = (
     record: PluginRecord,
     tool: AnyAgentTool | OpenClawPluginToolFactory,
-    opts?: { name?: string; names?: string[]; optional?: boolean },
+    opts?: OpenClawPluginToolOptions,
   ) => {
     const names = opts?.names ?? (opts?.name ? [opts.name] : []);
     const optional = opts?.optional === true;
@@ -314,6 +317,7 @@ export function createPluginRegistry(registryParams: PluginRegistryParams) {
       optional,
       source: record.source,
       rootDir: record.rootDir,
+      effectProfile: opts?.effectProfile,
     });
   };
 

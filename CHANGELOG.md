@@ -3,6 +3,91 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.3.0 — 2026-04-02
+
+Phase 3a: Vector-based implied consent derivation with SQLite + sqlite-vec pattern store.
+
+### Phase 3a: Implied Consent Derivation — Vector Store (`src/consent/implied-consent-store.ts`)
+
+- Persistent SQLite + sqlite-vec store for consent pattern matching at `~/.openclaw/consent/consent-patterns.sqlite`.
+- Schema: `patterns` table (text, effects JSON, source, confidence, timestamps) with unique text index, `pattern_embeddings` vec0 virtual table for cosine-distance KNN search, `meta` table for schema versioning and embedding dimension tracking.
+- Embedding dimension change detection: automatically drops and rebuilds the vec0 table and resets the seeded flag so patterns are re-embedded.
+- CRUD operations: `insertPattern`, `upsertPattern` (with dimension validation), `getPatternById`, `getPatternByText`, `getAllPatterns`, `deletePattern`.
+- `searchSimilarPatterns`: KNN vector search with configurable k and distance threshold, joins pattern metadata for full results.
+- `seedConsentPatternStore`: populate the store with seed data and embeddings, skipping when already seeded.
+- Path resolution: `resolveConsentStorePath` (explicit) and `resolveDefaultConsentStorePath` (async, loads from config).
+
+### Phase 3a: Seed Data (`src/consent/implied-consent-seed.ts`)
+
+- 95 curated canonical request patterns covering all 10 EffectClass categories.
+- Organized by primary effect: read-only, file writing, communication, shell execution, deletion, network, elevated, audience-expand, and compound multi-effect patterns.
+
+### Phase 3a: Deterministic Heuristic Fallback (`src/consent/implied-consent-heuristic.ts`)
+
+- 8 keyword/regex rules covering execution, file writing, deletion, communication, audience expansion, network, elevated, and physical effects.
+- Always includes `read` + `compose` as baseline when any rule matches.
+- Acts as primary fallback when vector search is unavailable and as augmenter in "both" mode.
+
+### Phase 3a: Orchestrator (`src/consent/implied-consent.ts`)
+
+- `deriveImpliedEffects`: main entry point supporting three modes — `vector` (vector search only), `heuristic` (keyword rules only), `both` (union of vector + heuristic, default).
+- Graceful degradation: vector failure falls back to heuristic; heuristic failure falls back to `["read", "compose"]`.
+- Singleton store lifecycle with lazy initialization and one-time seeding.
+- Embedding provider resolution via `listMemoryEmbeddingProviders` with auto-selection or explicit provider ID.
+- Dimension probing: embeds a probe string to determine dimension before opening the store.
+
+### Phase 3a: Configuration (`src/config/types.openclaw.ts`, `src/config/zod-schema.ts`)
+
+- New `consent.impliedEffects` config section with `provider`, `model`, `threshold`, `topK`, and `mode` options.
+- Zod validation for all config keys with sensible defaults (threshold: 0.35, topK: 5, mode: "both").
+
+### Phase 3a: Integration (`src/consent/integration.ts`)
+
+- `initializeConsentForRun` is now async; dynamically imports `deriveImpliedEffects` when no explicit `impliedEffects` are provided.
+- Loads `consent.impliedEffects` config from the main config and passes it to the orchestrator.
+- `FALLBACK_IMPLIED_EFFECTS` (`["read", "compose"]`) used when both vector search and heuristic derivation fail.
+
+### Phase 3a: Tests
+
+- `src/consent/implied-consent-heuristic.test.ts`: 15 tests — keyword detection for all effect categories, compound requests, case insensitivity, baseline inclusion, deduplication.
+- `src/consent/implied-consent-store.test.ts`: 13 tests — schema creation, insert/upsert/delete/get, vector similarity search, distance thresholding, dimension validation, metadata, unique constraints, seed population. Guarded with `describe.runIf` for sqlite-vec availability.
+- `src/consent/implied-consent.test.ts`: 8 tests — end-to-end vector derivation, mode merging, heuristic fallback on provider failure, heuristic-only mode, effect merging, default effects. Guarded with `describe.runIf` for sqlite-vec availability.
+
+---
+
+## 0.2.0 — 2026-04-02
+
+Phase 2: Wire consent verification into the tool execution pipeline.
+
+### Phase 2: WO Minting at Agent Run Start (`src/consent/integration.ts`)
+
+- `createPurchaseOrder`: factory that builds a PO from agent run context (request text, sender identity, channel, session, agent ID, implied effects).
+- `initializeSigningKey`: one-shot initialization from `CBA_SIGNING_KEY` environment variable; falls back to per-process random key.
+- `initializeConsentForRun`: full consent context initialization — derives implied effects, creates PO, mints initial WO via the binder, builds scope state. Returns `undefined` on binder refusal for graceful degradation.
+- `ConsentEnforcementMode`: `log` (default, debug-level), `warn`, `enforce` — resolved from `CBA_ENFORCEMENT` env var.
+
+### Phase 2: Before-Tool-Call WO Verification (`src/consent/integration.ts`)
+
+- `verifyToolConsent`: reads the active WO from `AsyncLocalStorage`, looks up the tool's effect profile (from argument or registry), and verifies all tool effects are covered by WO grants.
+- When no consent scope is active, returns `allowed: true` (opt-in enforcement).
+- Enforcement mode governs failure behavior: `log` and `warn` modes allow execution; `enforce` mode blocks with a structured refusal containing the verification result.
+
+### Phase 2: Plugin Tool Effect Profile Registration
+
+- Extended `OpenClawPluginToolOptions` in `src/plugins/types.ts` with optional `effectProfile` field.
+- Extended `PluginToolRegistration` in `src/plugins/registry.ts` with optional `effectProfile` field.
+- `src/plugins/bundled-capability-runtime.ts`: propagates `effectProfile` from tool objects to registry entries.
+
+### Phase 2: Scope Entry in Agent Run (`src/agents/pi-embedded-runner/run/attempt.ts`)
+
+- Calls `initializeConsentForRun` at agent run start and binds the consent scope via `enterConsentScope` for the duration of the run.
+
+### Phase 2: Tests
+
+- `src/consent/integration.test.ts`: 16 tests — PO creation (defaults, optional fields, explicit effects, defensive copies), enforcement mode resolution (all modes, invalid values), consent initialization (full context, binder refusal, signing key configuration, explicit vs derived effects), tool verification (no scope, covered effects, log/warn/enforce modes, registry fallback, unknown tools), enterConsentScope (ALS binding, verifyToolConsent visibility), end-to-end flow (initialize + verify within scope, log-mode passthrough).
+
+---
+
 ## 0.1.0 — 2026-04-02
 
 Initial implementation of the Consent-Bound Agency (CBA) framework, Phase 0 and Phase 1.

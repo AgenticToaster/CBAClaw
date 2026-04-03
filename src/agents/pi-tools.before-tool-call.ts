@@ -1,4 +1,5 @@
 import type { ToolLoopDetectionConfig } from "../config/types.tools.js";
+import { verifyToolConsent } from "../consent/integration.js";
 import type { SessionState } from "../logging/diagnostic-session-state.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { getGlobalHookRunner } from "../plugins/hook-runner-global.js";
@@ -372,9 +373,18 @@ export function wrapToolWithBeforeToolCallHook(
     return tool;
   }
   const toolName = tool.name || "tool";
+  const toolEffectProfile = tool.effectProfile;
   const wrappedTool: AnyAgentTool = {
     ...tool,
     execute: async (toolCallId, params, signal, onUpdate) => {
+      // CBA: verify active Work Order covers this tool's effects before any
+      // other processing. Enforcement mode (log/warn/enforce) is resolved
+      // from CBA_ENFORCEMENT env var; defaults to "log" for safe rollout.
+      const consentOutcome = verifyToolConsent(toolName, toolEffectProfile);
+      if (!consentOutcome.allowed) {
+        throw new Error(consentOutcome.reason);
+      }
+
       const outcome = await runBeforeToolCallHook({
         toolName,
         params,

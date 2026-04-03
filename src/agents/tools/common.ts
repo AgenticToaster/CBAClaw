@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import type { AgentTool, AgentToolResult } from "@mariozechner/pi-agent-core";
+import type { ToolEffectProfile } from "../../consent/types.js";
 import { detectMime } from "../../media/mime.js";
 import { readSnakeCaseParamRaw } from "../../param-key.js";
 import type { ImageSanitizationLimits } from "../image-sanitization.js";
@@ -9,6 +10,8 @@ import { sanitizeToolResultImages } from "../tool-images.js";
 export type AnyAgentTool = AgentTool<any, unknown> & {
   ownerOnly?: boolean;
   displaySummary?: string;
+  /** Consent-Bound Agency effect profile. Used by the WO verification hook. */
+  effectProfile?: ToolEffectProfile;
 };
 
 export type StringParamOptions = {

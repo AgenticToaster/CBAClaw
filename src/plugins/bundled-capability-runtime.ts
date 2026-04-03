@@ -354,6 +354,7 @@ export function loadBundledCapabilityRuntimeRegistry(params: {
           optional: false,
           source: record.source,
           rootDir: record.rootDir,
+          effectProfile: tool.effectProfile,
         })),
       );
       registry.plugins.push(record);

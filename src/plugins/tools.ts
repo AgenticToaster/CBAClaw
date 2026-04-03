@@ -182,6 +182,9 @@ export function resolvePluginTools(params: {
         pluginId: entry.pluginId,
         optional: entry.optional,
       });
+      if (entry.effectProfile && !tool.effectProfile) {
+        tool.effectProfile = entry.effectProfile;
+      }
       tools.push(tool);
     }
   }
