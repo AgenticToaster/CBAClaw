@@ -3,6 +3,43 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.7.0 — 2026-04-02
+
+Phase 4c/4d: EAA orchestration integration and system prompt consent instructions.
+
+### Phase 4c: EAA Integration into Orchestration Pipeline (`src/consent/eaa-integration.ts`)
+
+- `handleConsentFailure`: single orchestration entry point called when `verifyToolConsent` returns `allowed: false` under `enforce` mode. Routes through consent precedent reuse, EAA trigger evaluation, and either standard CO creation or full EAA adjudication.
+- Step 1 — **Consent precedent reuse**: checks the `ConsentRecordStore` for a prior granted, non-expired record whose effects cover the missing effects. On hit, mints a successor WO with an `explicit` consent anchor referencing the precedent record and transitions scope immediately.
+- Step 2 — **EAA trigger evaluation**: calls `evaluateEAATriggers` with the current tool context. When no triggers fire, falls through to standard CO.
+- Step 3 — **Standard Change Order**: when EAA is not triggered, creates a CO via `requestChangeOrder` (Phase 3b) with the missing effects and tool context. Returns `{ action: "co-requested", changeOrder }`.
+- Step 4 — **EAA adjudication**: when triggers fire and an `EAAInferenceFn` is available, runs `runElevatedActionAnalysis` (Phase 4b). Processes all six outcomes:
+  - `proceed`: mints successor WO with `eaa` consent anchor, transitions scope.
+  - `request-consent`: creates an enriched CO with EAA reasoning context in the CO reason field.
+  - `constrained-comply`: mints successor WO with recommended constraints and `eaa` anchor.
+  - `emergency-act`: mints successor WO with time-bounded constraints and `eaa` anchor.
+  - `refuse`: returns structured refusal with EAA reasoning.
+  - `escalate`: returns structured escalation with EAA reasoning.
+- EAA record persistence: dual-writes to both the scope chain (`addEAARecord`) and the persistent `ConsentRecordStore` (`insertEAARecord`). Both writes are fault-tolerant — failures are logged but do not block the resolution.
+- Failure handling: when EAA is triggered but no inference function is provided, returns a structured refusal. When `runElevatedActionAnalysis` itself fails, returns a refusal with the failure reason and fallback outcome.
+- `ConsentFailureResolution` discriminated union: `co-requested` (with `ChangeOrder`), `eaa-resolved` (with outcome, optional successor WO, explanation, adjudication, and reasoning), or `refused` (with reason).
+
+### Phase 4d: System Prompt Consent Instructions (`src/agents/system-prompt.ts`)
+
+- `buildConsentBoundAgencySection`: new system prompt section gated by `cbaEnabled` parameter (defaults to `false`, excluded in `minimal`/`none` prompt modes). Placed after the Safety section and before OpenClaw CLI Quick Reference.
+- **Effect Awareness**: lists all 10 effect classes with human-readable descriptions. Instructs the agent that effects, not tool names, are the unit of consent.
+- **Consent Boundary Recognition**: examples of boundary crossings (draft to send, read to persist, compose to publish, search to execute, suggest to modify). Instructs the agent to pause and request a Change Order when a crossing is detected.
+- **Change Order Participation**: instructs the agent to frame CO requests in effect language, accept denials gracefully, and never repeat denied requests without new justification.
+- **Elevated Action Analysis Awareness**: describes EAA triggers (standing ambiguity, effect ambiguity, duty collisions, novel tools, irreversible actions). Explains the agent's advisory role — honest grounded assessment, not self-granted authority.
+- **Refusal as Discretion**: frames refusal as a first-class outcome. Agent must explain why, state what it would need to proceed, and suggest safer alternatives within the current scope.
+
+### Phase 4c/4d: Tests
+
+- `src/consent/eaa-integration.test.ts`: 18 tests — consent precedent reuse (hit with successor WO minting, fallthrough on miss), standard CO path (no EAA triggers), EAA `request-consent` (low confidence triggers enriched CO), EAA `proceed` (high confidence + low risk), EAA `constrained-comply` (moderate confidence + non-critical risk), EAA `refuse` (inviolable duty collision), EAA `emergency-act` (urgency text + physical effects), EAA `escalate` (elevated + physical + low confidence), EAA record persistence to store, refused when no inference function provided, refused when EAA analysis fails. Internal helper tests: `createStandardChangeOrder` (success, empty effects refusal), `mintSuccessorWithAnchor` (EAA anchor, constraints), `persistEAARecord` (store write, no-store safety).
+- `src/agents/system-prompt.test.ts`: 9 new CBA tests (57 total) — section inclusion (`cbaEnabled: true`), exclusion (`false`, `undefined`, `minimal` mode), all 10 effect classes listed, boundary crossing examples, EAA trigger descriptions, refusal guidance, section ordering (after Safety, before CLI Reference).
+
+---
+
 ## 0.6.0 — 2026-04-02
 
 Phase 4b: Elevated Action Analysis (EAA) adjudication loop.

@@ -1,15 +1,15 @@
-# CBA Phase 4 Implementation Summary (In Progress)
+# CBA Phase 4 Implementation Summary
 
-Token-optimized handoff for Phase 4c/4d implementation.
+Token-optimized handoff for Phase 5 implementation.
 
 ## Repo Context
 
 - Repo: CBAClaw (fork of openclaw/openclaw)
-- CBA module: `src/consent/` (Phase 0-1 types/binder/scope-chain + Phase 2 integration + Phase 3 consent lifecycle + Phase 4a EAA triggers + Phase 4b EAA adjudication)
-- Tests: `npx vitest run src/consent/` — 330 passing, 16 skipped (sqlite-vec not in test env)
+- CBA module: `src/consent/` (Phase 0-1 types/binder/scope-chain + Phase 2 integration + Phase 3 consent lifecycle + Phase 4 EAA)
+- Tests: `npx vitest run src/consent/ src/agents/system-prompt.test.ts` — 408 passing, 16 skipped (sqlite-vec not in test env)
 - Prior summaries: `plans/phase-0-1-summary.md`, `plans/phase-2-summary.md`, `plans/phase-3-summary.md`
 
-## Files Delivered (Phase 4a + 4b)
+## Files Delivered (Phase 4a + 4b + 4c + 4d)
 
 ### New Files
 
@@ -19,13 +19,18 @@ src/consent/
   eaa-triggers.test.ts     # 55 tests
   eaa.ts                   # 6-step adjudication loop, runElevatedActionAnalysis (825 LOC)
   eaa.test.ts              # 58 tests
+  eaa-integration.ts       # handleConsentFailure orchestration wiring (459 LOC)
+  eaa-integration.test.ts  # 18 tests
 ```
 
 ### Modified Files
 
 ```
 src/consent/
-  index.ts                 # Barrel updated with Phase 4a + 4b exports
+  index.ts                 # Barrel updated with Phase 4a + 4b + 4c exports
+src/agents/
+  system-prompt.ts         # buildConsentBoundAgencySection (Phase 4d)
+  system-prompt.test.ts    # 9 new CBA tests (57 total)
 ```
 
 ## Phase 4a Architecture
@@ -263,14 +268,92 @@ runElevatedActionAnalysis({po, activeWO, toolName, toolProfile, triggerResult,
 | duty-privacy               | privacy         | disclose, persist, network   | strong      |
 | duty-oversight             | oversight       | elevated, exec               | strong      |
 
+## Phase 4c Architecture
+
+```
+verifyToolConsent() → "effect-not-granted" (enforce mode)
+    │
+    ▼
+handleConsentFailure({toolName, toolProfile, missingEffects, po, activeWO,
+                       ambiguity?, consentRecords, eaaRecords, dutyConstraints,
+                       patternStore?, consentRecordStore?, infer?})
+    │
+    ├── Step 1: findConsentPrecedent()     → precedent found?
+    │     ├── yes → mintSuccessorWorkOrder(anchor: explicit) → transitionWorkOrder → proceed
+    │     └── no  → continue
+    │
+    ├── Step 2: evaluateEAATriggers()      → EAATriggerResult
+    │
+    ├── Step 3: not triggered → requestChangeOrder() → co-requested
+    │
+    └── Step 4: triggered → runElevatedActionAnalysis()
+          │
+          ├── proceed         → mintSuccessorWorkOrder(anchor: eaa) → eaa-resolved
+          ├── request-consent → requestChangeOrder(enriched) → co-requested
+          ├── constrained-comply → mintSuccessorWorkOrder(constraints, anchor: eaa) → eaa-resolved
+          ├── emergency-act   → mintSuccessorWorkOrder(time-bounded, anchor: eaa) → eaa-resolved
+          ├── refuse          → eaa-resolved (no successor WO)
+          └── escalate        → eaa-resolved (no successor WO)
+```
+
+### eaa-integration.ts
+
+#### Exported Types
+
+- **`ConsentFailureResolution`**: discriminated union on `action`:
+  - `"co-requested"`: `{ changeOrder: ChangeOrder }`
+  - `"eaa-resolved"`: `{ outcome: EAAOutcome, successorWO?: WorkOrder, explanation: string, adjudication?: EAAAdjudicationResult, reasoning?: EAAReasoningRecord }`
+  - `"refused"`: `{ reason: string }`
+- **`HandleConsentFailureParams`**: `{ toolName, toolProfile, missingEffects, po, activeWO, ambiguity?, consentRecords, eaaRecords, dutyConstraints, patternStore?, consentRecordStore?, infer? }`
+
+#### Exported Functions
+
+| Function               | Signature                                                                  | Description                                           |
+| ---------------------- | -------------------------------------------------------------------------- | ----------------------------------------------------- |
+| `handleConsentFailure` | `(params: HandleConsentFailureParams) → Promise<ConsentFailureResolution>` | Orchestration entry for consent verification failures |
+
+#### Internal Helpers (testing seam)
+
+| Function                    | Description                                                        |
+| --------------------------- | ------------------------------------------------------------------ |
+| `createStandardChangeOrder` | Creates CO via `requestChangeOrder` without EAA context            |
+| `mintSuccessorWithAnchor`   | Thin wrapper over `mintSuccessorWorkOrder` with anchor/constraints |
+| `persistEAARecord`          | Dual-write to scope chain + persistent store (fault-tolerant)      |
+| `processEAAOutcome`         | Maps EAA outcome to `ConsentFailureResolution`                     |
+
+## Phase 4d System Prompt Section
+
+### Structure
+
+```
+## Consent-Bound Agency          ← gated by cbaEnabled === true, excluded in minimal/none
+├── ### Effect Awareness          ← 10 effect classes with descriptions
+├── ### Consent Boundary Recognition  ← 5 boundary crossing examples
+├── ### Change Order Participation    ← effect-language framing, denial handling
+├── ### Elevated Action Analysis Awareness  ← triggers, advisory role
+└── ### Refusal as Discretion     ← first-class outcome, explain + alternatives
+```
+
+### Insertion Point
+
+After `## Safety`, before `## OpenClaw CLI Quick Reference`.
+
+### Gating
+
+- `cbaEnabled: true` → included
+- `cbaEnabled: false` or `undefined` → excluded
+- `promptMode: "minimal"` or `"none"` → excluded regardless of `cbaEnabled`
+
 ## Test Summary
 
-| File                 | Tests | Skipped | Coverage                                                                    |
-| -------------------- | ----- | ------- | --------------------------------------------------------------------------- |
-| eaa-triggers.test.ts | 55    | 0       | All 8 detectors, composite evaluation, default duties, severity, edge cases |
-| eaa.test.ts          | 58    | 0       | All 6 steps, outcome selection, failure handling, artifact integrity, e2e   |
+| File                    | Tests | Skipped | Coverage                                                                    |
+| ----------------------- | ----- | ------- | --------------------------------------------------------------------------- |
+| eaa-triggers.test.ts    | 55    | 0       | All 8 detectors, composite evaluation, default duties, severity, edge cases |
+| eaa.test.ts             | 58    | 0       | All 6 steps, outcome selection, failure handling, artifact integrity, e2e   |
+| eaa-integration.test.ts | 18    | 0       | Precedent reuse, standard CO, all 6 EAA outcomes, failure paths, helpers    |
+| system-prompt.test.ts   | 9 new | 0       | CBA gating, content verification, section ordering                          |
 
-**Full consent suite: 330 passing, 16 skipped** (skipped tests require sqlite-vec native extension).
+**Full consent + system prompt suite: 408 passing, 16 skipped** (skipped tests require sqlite-vec native extension).
 
 ## Design Decisions
 
@@ -306,20 +389,22 @@ runElevatedActionAnalysis({po, activeWO, toolName, toolProfile, triggerResult,
 
 14. **Constrained-comply strips irreversible at serious risk**: When risk severity is "serious" and `constrained-comply` is selected, the recommended effect set drops `irreversible`. This implements the principle of least invasive sufficient action — if the effect is high-risk and the situation is serious, don't recommend it in the constrained path.
 
-## What Remains
+### Phase 4c
 
-### Phase 4c: EAA Integration (`src/consent/eaa-integration.ts`)
+15. **Consent precedent reuse as first check**: Before evaluating EAA triggers, `handleConsentFailure` checks the `ConsentRecordStore` for a prior granted record covering the missing effects. This avoids re-running full EAA adjudication when the user has already consented to the same effects in a prior interaction. The precedent-based successor WO uses an `explicit` consent anchor (not `eaa`) because the grant was originally user-initiated.
 
-- `handleConsentFailure`: orchestration wiring from `verifyToolConsent` failure path through precedent check → EAA trigger evaluation → EAA/CO routing.
-- EAA-to-CO handoff for `request-consent` outcome.
-- Binder anchor verification for EAA anchors.
-- Successor WO minting from adjudication results.
-- Persist EAARecord to consent store, add to scope chain, build ConsentAnchor of kind "eaa".
+16. **Fault-tolerant EAA record persistence**: `persistEAARecord` dual-writes to the scope chain (`addEAARecord`) and the persistent store (`insertEAARecord`). Both writes are wrapped in try/catch — a storage failure does not block the consent resolution. This matters because the scope chain is the runtime authority and the store is for audit/precedent.
 
-### Phase 4d: System Prompt Updates
+17. **Enriched CO for request-consent**: When EAA returns `request-consent`, the CO is created via `requestChangeOrder` with the EAA reasoning injected into the `reason` field. This gives the user richer context for their consent decision without changing the CO schema.
 
-- Effect awareness block in system prompt.
-- Consent boundary recognition instructions.
-- CO participation instructions.
-- EAA slow-down awareness.
-- Refusal-as-discretion framing.
+18. **No infer → refuse**: When EAA triggers fire but no `EAAInferenceFn` is provided (e.g., no LLM configured), the function returns a structured refusal rather than silently falling back to a standard CO. This enforces the principle that once EAA is warranted, the deliberation cannot be skipped.
+
+19. **ConsentFailureResolution extends plan spec**: The `eaa-resolved` variant includes optional `adjudication` and `reasoning` fields beyond the plan's `outcome + successorWO? + explanation`. These are additive and allow callers to inspect the full EAA output without a separate lookup.
+
+### Phase 4d
+
+20. **CBA section gated by explicit opt-in**: `cbaEnabled` must be exactly `true` for the section to appear. This prevents CBA instructions from leaking into production prompts before the framework is ready for general use. The `false`/`undefined` default ensures backward compatibility.
+
+21. **Effect-language over tool-language**: The system prompt consistently frames consent in terms of effects, not tool names. This matches the framework's core principle and helps the agent generalize consent reasoning across tools that share effect profiles.
+
+22. **Refusal framing as discretion**: The system prompt explicitly frames refusal as a valid, professional outcome. This counteracts the tendency of language models to prefer compliance over caution, and supports the EAA's `refuse` and `escalate` outcomes at the prompt level.

@@ -158,6 +158,10 @@ export type {
 } from "./eaa-triggers.js";
 export { DEFAULT_DUTY_CONSTRAINTS, evaluateEAATriggers } from "./eaa-triggers.js";
 
+// Phase 4c: EAA Integration into Orchestration Pipeline
+export type { ConsentFailureResolution, HandleConsentFailureParams } from "./eaa-integration.js";
+export { handleConsentFailure } from "./eaa-integration.js";
+
 // Phase 4b: EAA Adjudication Loop
 export type {
   ActionAlternative,

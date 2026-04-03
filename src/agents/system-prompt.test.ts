@@ -740,6 +740,119 @@ describe("buildAgentSystemPrompt", () => {
     expect(prompt).toContain("## Reactions");
     expect(prompt).toContain("Reactions are enabled for Telegram in MINIMAL mode.");
   });
+
+  describe("Consent-Bound Agency section", () => {
+    it("includes CBA section when cbaEnabled is true", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: true,
+      });
+
+      expect(prompt).toContain("## Consent-Bound Agency");
+      expect(prompt).toContain("### Effect Awareness");
+      expect(prompt).toContain("### Consent Boundary Recognition");
+      expect(prompt).toContain("### Change Order Participation");
+      expect(prompt).toContain("### Elevated Action Analysis Awareness");
+      expect(prompt).toContain("### Refusal as Discretion");
+    });
+
+    it("omits CBA section when cbaEnabled is false", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: false,
+      });
+
+      expect(prompt).not.toContain("## Consent-Bound Agency");
+      expect(prompt).not.toContain("### Effect Awareness");
+    });
+
+    it("omits CBA section by default (cbaEnabled unset)", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+      });
+
+      expect(prompt).not.toContain("## Consent-Bound Agency");
+    });
+
+    it("omits CBA section in minimal prompt mode", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: true,
+        promptMode: "minimal",
+      });
+
+      expect(prompt).not.toContain("## Consent-Bound Agency");
+    });
+
+    it("lists all 10 effect classes", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: true,
+      });
+
+      const effectClasses = [
+        "- read:",
+        "- compose:",
+        "- persist:",
+        "- disclose:",
+        "- audience-expand:",
+        "- irreversible:",
+        "- exec:",
+        "- network:",
+        "- elevated:",
+        "- physical:",
+      ];
+      for (const effect of effectClasses) {
+        expect(prompt).toContain(effect);
+      }
+    });
+
+    it("includes boundary crossing examples", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: true,
+      });
+
+      expect(prompt).toContain("draft → send");
+      expect(prompt).toContain("compose → disclose");
+    });
+
+    it("includes EAA trigger descriptions", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: true,
+      });
+
+      expect(prompt).toContain("standing ambiguity");
+      expect(prompt).toContain("effect ambiguity");
+      expect(prompt).toContain("duty collisions");
+    });
+
+    it("includes refusal guidance", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: true,
+      });
+
+      expect(prompt).toContain("Refusal is a first-class outcome");
+      expect(prompt).toContain("Explain why you are refusing");
+    });
+
+    it("places CBA section after Safety section", () => {
+      const prompt = buildAgentSystemPrompt({
+        workspaceDir: "/tmp/openclaw",
+        cbaEnabled: true,
+      });
+
+      const safetyIndex = prompt.indexOf("## Safety");
+      const cbaIndex = prompt.indexOf("## Consent-Bound Agency");
+      const cliIndex = prompt.indexOf("## OpenClaw CLI Quick Reference");
+
+      expect(safetyIndex).toBeGreaterThan(-1);
+      expect(cbaIndex).toBeGreaterThan(safetyIndex);
+      expect(cliIndex).toBeGreaterThan(cbaIndex);
+    });
+  });
 });
 
 describe("buildSubagentSystemPrompt", () => {

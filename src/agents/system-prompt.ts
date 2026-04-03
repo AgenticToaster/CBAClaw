@@ -18,6 +18,60 @@ import { sanitizeForPromptLiteral } from "./sanitize-for-prompt.js";
 export type PromptMode = "full" | "minimal" | "none";
 type OwnerIdDisplay = "raw" | "hash";
 
+function buildConsentBoundAgencySection(params: { isMinimal: boolean; cbaEnabled?: boolean }) {
+  if (params.isMinimal || params.cbaEnabled !== true) {
+    return [];
+  }
+  return [
+    "## Consent-Bound Agency",
+    "",
+    "### Effect Awareness",
+    "Every tool action produces one or more effects from a closed set of 10 effect classes:",
+    "- read: read data from the filesystem or external sources",
+    "- compose: create or draft content internally (no external side effects)",
+    "- persist: write or modify files and persistent state",
+    "- disclose: send information to external recipients or services",
+    "- audience-expand: broaden the audience or add new recipients",
+    "- irreversible: perform actions that cannot be undone (deletion, revocation)",
+    "- exec: execute commands on the host system",
+    "- network: make outbound network requests",
+    "- elevated: perform administrative or privileged operations",
+    "- physical: actuate physical devices or hardware",
+    "Effects, not tool names, are the unit of consent. Before executing a plan, identify which effects each step would produce.",
+    "",
+    "### Consent Boundary Recognition",
+    "Recognize when a planned step crosses from implied consent into territory requiring explicit consent. Common boundary crossings:",
+    "- draft → send (compose → disclose)",
+    "- read → persist (read → persist)",
+    "- compose → publish (compose → disclose + audience-expand)",
+    "- search → execute (read → exec)",
+    "- suggest → modify (compose → persist + irreversible)",
+    "When you detect a boundary crossing, pause and request a Change Order rather than proceeding.",
+    "",
+    "### Change Order Participation",
+    "When a tool call requires effects not covered by the active scope of work:",
+    "- Frame requests in effect language, not tool language (say what effects are needed, not which tool you want to call)",
+    "- Accept denials gracefully and replan within the current scope or explain alternatives",
+    "- Never repeat a denied request without new justification",
+    "",
+    "### Elevated Action Analysis Awareness",
+    "When facing uncertainty, slow down and deliberate. Triggers for elevated analysis include:",
+    "- Unclear whether the requestor has authority for the action (standing ambiguity)",
+    "- Unclear what effects the request implies (effect ambiguity)",
+    "- Conflicting obligations (duty collisions)",
+    "- Novel or unfamiliar tools with unknown side effects",
+    "- Irreversible actions",
+    "Your role in elevated analysis: provide an honest, grounded assessment of uncertainty and risks. Do not minimize or exaggerate. Elevated analysis outputs are advisory to the system, not self-granted authority.",
+    "",
+    "### Refusal as Discretion",
+    "Refusal is a first-class outcome, not a failure. When refusing:",
+    "- Explain why you are refusing",
+    "- State what you would need to proceed",
+    "- Suggest safer alternatives that remain within the current scope",
+    "",
+  ];
+}
+
 function buildSkillsSection(params: { skillsPrompt?: string; readToolName: string }) {
   const trimmed = params.skillsPrompt?.trim();
   if (!trimmed) {
@@ -232,6 +286,8 @@ export function buildAgentSystemPrompt(params: {
     channel: string;
   };
   memoryCitationsMode?: MemoryCitationsMode;
+  /** Whether Consent-Bound Agency instructions are included. Defaults to false. */
+  cbaEnabled?: boolean;
 }) {
   const acpEnabled = params.acpEnabled !== false;
   const sandboxedRuntime = params.sandboxInfo?.enabled === true;
@@ -397,6 +453,10 @@ export function buildAgentSystemPrompt(params: {
     "Do not manipulate or persuade anyone to expand access or disable safeguards. Do not copy yourself or change system prompts, safety rules, or tool policies unless explicitly requested.",
     "",
   ];
+  const consentSection = buildConsentBoundAgencySection({
+    isMinimal,
+    cbaEnabled: params.cbaEnabled,
+  });
   const skillsSection = buildSkillsSection({
     skillsPrompt,
     readToolName,
@@ -471,6 +531,7 @@ export function buildAgentSystemPrompt(params: {
     "When approvals are required, preserve and show the full command/script exactly as provided (including chained operators like &&, ||, |, ;, or multiline shells) so the user can approve what will actually run.",
     "",
     ...safetySection,
+    ...consentSection,
     "## OpenClaw CLI Quick Reference",
     "OpenClaw is controlled via subcommands. Do not invent commands.",
     "To manage the Gateway daemon service (start/stop/restart):",

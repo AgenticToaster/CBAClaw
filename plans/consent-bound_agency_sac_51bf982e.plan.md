@@ -31,12 +31,36 @@ todos:
     status: completed
   - id: phase-4c-integration
     content: "EAA orchestration integration: handleConsentFailure wiring into verifyToolConsent failure path, precedent reuse check, EAA-to-CO handoff for request-consent outcome, binder anchor verification for eaa anchors, successor WO minting from adjudication results"
-    status: pending
+    status: completed
   - id: phase-4d-system-prompt
     content: "System prompt updates: effect awareness block, consent boundary recognition, CO participation instructions, EAA slow-down awareness, refusal-as-discretion framing"
+    status: completed
+  - id: phase-5a-types
+    content: "Standing policy type system: StandingPolicy, PolicyApplicabilityPredicate, EscalationRule, PolicyExpiry, PolicyProvenance, PolicyStatus, type guard isFullStandingPolicy, backward compat with StandingPolicyStub"
     status: pending
-  - id: phase-5-policies
-    content: "Standing policies with bounding boxes, policy classes (user/self-minted/system), dynamic skill trust tiers, effect profiles for plugin tools. Pattern store reusable for natural-language policy matching."
+  - id: phase-5b-store
+    content: "Policy persistence: SQLite policy store (agent-global, not per-session), policies + policy_usage tables, CRUD interface, usage tracking, expiry sweep, embedding support via sqlite-vec"
+    status: pending
+  - id: phase-5c-binder
+    content: "Binder policy evaluation: policy application order (system → user → self-minted), applicability predicate matching, escalation rule evaluation, policy anchor verification in verifyConsentAnchorAgainstRecords, augmented mintInitialWorkOrder"
+    status: pending
+  - id: phase-5d-defaults
+    content: "Default system policies: read/compose baseline, physical-EAA escalation, elevated-owner restriction. Loaded at startup alongside DEFAULT_DUTY_CONSTRAINTS."
+    status: pending
+  - id: phase-5e-proposal
+    content: "Self-minted policy proposal: consent record pattern analysis, repetition detection, high-risk safety constraints, pending-confirmation lifecycle, user confirmation prompt"
+    status: pending
+  - id: phase-5f-trust
+    content: "Dynamic trust tiers for plugin tools: manifest declaration, derived tier from plugin source (bundled/npm/MCP), trust-tier impact on policy acceptance and EAA thresholds"
+    status: pending
+  - id: phase-5g-pattern
+    content: "Pattern store reuse for policy matching: policy embedding, semantic search for policy discovery, conflict detection, CO-to-policy promotion"
+    status: pending
+  - id: phase-5h-config
+    content: "Configuration surface: consent.policies config section (enabled, storePath, selfMintedMaxExpiryMs, selfMintedMinRepetitions, enableEmbeddings), Zod schema, config baseline regeneration"
+    status: pending
+  - id: phase-5i-integration
+    content: "Pipeline integration: policy-loaded initializeConsentForRun, policy bypass in handleConsentFailure, policies passed to mintSuccessorWithAnchor, index.ts barrel update"
     status: pending
   - id: phase-6-observability
     content: Scope chain event model, action receipts (confirmation/receipt/report), gateway protocol extensions for consent methods, metrics tracking
@@ -643,43 +667,631 @@ Update `[src/agents/system-prompt.ts](src/agents/system-prompt.ts)` to include c
 
 ## Phase 5: Standing Policies and Extensibility
 
-### 5a. Standing Policies with Bounding Boxes
+Standing policies are the persistent, reusable consent posture that reduces friction for routine operations while maintaining strict boundaries on high-risk actions. They replace the `StandingPolicyStub` placeholder used throughout Phases 0-4 with a full policy engine that the binder evaluates at mint time.
 
-Create `src/consent/policy.ts`:
+**Key invariant (from PDF Section IV)**: standing policies are bounding boxes, not blank checks. A policy grants pre-authorized consent for a bounded set of effects under specific conditions. The binder verifies policies are valid, non-expired, and applicable before using them as consent anchors.
+
+**Three policy classes**:
+
+1. **System policies** -- inviolable, hardcoded or loaded from config, cannot be overridden by user consent
+2. **User policies** -- created by the agent owner/operator, require confirmation before first use
+3. **Self-minted policies** -- proposed by the agent based on repeated consent patterns, require user confirmation before activation
+
+### 5a. Standing Policy Type System
+
+Create `src/consent/policy.ts` with the full `StandingPolicy` type and supporting types. This replaces the `StandingPolicyStub` that the binder has accepted since Phase 1.
 
 ```typescript
 export type StandingPolicy = {
   id: string;
-  class: "user" | "self-minted" | "system";
+  /** Policy class determines precedence and override behavior. */
+  class: PolicyClass;
+  /** Which effects this policy pre-authorizes. */
   effectScope: EffectClass[];
-  applicability: PolicyPredicate; // channel, chatType, time, etc.
+  /** When this policy applies (channel, time, chat type, etc.). */
+  applicability: PolicyApplicabilityPredicate;
+  /** Rules for when to escalate despite the policy granting consent. */
   escalationRules: EscalationRule[];
-  expiry?: { maxUses?: number; expiresAt?: number };
-  revocationSemantics: "immediate" | "after-current-slice";
-  provenance: { author: string; createdAt: number; confirmedAt?: number };
+  /** Expiry conditions -- policies are not eternal. */
+  expiry: PolicyExpiry;
+  /** What happens to in-flight work when the policy is revoked. */
+  revocationSemantics: PolicyRevocationSemantics;
+  /** Audit trail: who created this, when, and when confirmed. */
+  provenance: PolicyProvenance;
+  /** Human-readable description of what this policy permits. */
+  description: string;
+  /** Whether this policy is currently active and usable as a consent anchor. */
+  status: PolicyStatus;
+};
+
+export type PolicyClass = "user" | "self-minted" | "system";
+
+export type PolicyStatus = "active" | "pending-confirmation" | "revoked" | "expired";
+
+export type PolicyApplicabilityPredicate = {
+  /** Restrict to specific channels. Empty = all channels. */
+  channels?: string[];
+  /** Restrict to specific chat types. Empty = all types. */
+  chatTypes?: Array<"dm" | "group" | "public">;
+  /** Restrict to specific sender IDs. Empty = any sender. */
+  senderIds?: string[];
+  /** Only apply when sender is owner. */
+  requireOwner?: boolean;
+  /** Time-of-day window (24h format, agent-local timezone). */
+  timeWindow?: { startHour: number; endHour: number };
+  /** Only apply to specific tools. Empty = all tools with matching effects. */
+  toolNames?: string[];
+  /** Only apply to tools at or above this trust tier. */
+  minTrustTier?: TrustTier;
+};
+
+export type EscalationRule = {
+  /** Condition that forces escalation even when the policy would grant. */
+  condition: EscalationCondition;
+  /** What to do on escalation. */
+  action: "require-co" | "trigger-eaa" | "refuse";
+  description: string;
+};
+
+export type EscalationCondition =
+  | { kind: "effect-combination"; effects: EffectClass[] }
+  | { kind: "audience-exceeds"; maxRecipients: number }
+  | { kind: "frequency-exceeds"; maxPerHour: number }
+  | { kind: "trust-tier-below"; tier: TrustTier }
+  | { kind: "custom"; label: string; evaluate: (ctx: EscalationContext) => boolean };
+
+export type EscalationContext = {
+  toolName: string;
+  toolProfile: ToolEffectProfile;
+  po: PurchaseOrder;
+  recentInvocationCount: number;
+};
+
+export type PolicyExpiry = {
+  /** Absolute expiry timestamp. */
+  expiresAt?: number;
+  /** Maximum number of times this policy can be used as a consent anchor. */
+  maxUses?: number;
+  /** Current use count (incremented each time the policy anchors a WO). */
+  currentUses: number;
+};
+
+export type PolicyRevocationSemantics = "immediate" | "after-current-slice";
+
+export type PolicyProvenance = {
+  /** Who created the policy: user ID, "system", or "agent:<agentId>". */
+  author: string;
+  createdAt: number;
+  /** When a human confirmed the policy (required for self-minted). */
+  confirmedAt?: number;
+  /** Reference to the consent pattern or request that motivated creation. */
+  sourceRef?: string;
 };
 ```
 
-Integrate into config at `tools.consent.policies` or per-agent `agents.<id>.consent.policies`.
+#### Backward Compatibility
 
-### 5b. Policy Application Order
+The `StandingPolicyStub` type in `types.ts` remains as a narrow interface alias. Both the binder and callers that currently pass `StandingPolicyStub[]` continue to work. The binder's policy evaluation logic discriminates on the presence of `applicability` / `escalationRules` to determine whether it received a full `StandingPolicy` or a stub.
 
-In the binder, apply policies in precedence order:
+```typescript
+// In types.ts -- keep existing stub, add narrowing guard
+export type StandingPolicyStub = {
+  id: string;
+  policyClass: "user" | "self-minted" | "system";
+  effectScope: EffectClass[];
+};
 
-1. System policies (inviolable)
-2. Standing/consent checks
-3. EAA triggers (override user policies when high-stakes)
-4. User and confirmed policies (reduce friction)
+// In policy.ts -- type guard
+export function isFullStandingPolicy(p: StandingPolicyStub | StandingPolicy): p is StandingPolicy {
+  return "applicability" in p && "status" in p;
+}
+```
 
-### 5c. Dynamic Skill Trust Tiers
+### 5b. Policy Store (Persistence)
 
-Extend plugin manifest and tool registration to declare `trustTier`:
+Create `src/consent/policy-store.ts`. Policies persist across sessions (unlike consent records which are per-session).
 
-- `in-process` -- runs within the agent's enforcement boundary
-- `sandboxed` -- runs in a constrained environment
-- `external` -- out-of-band, external service
+#### Storage Location
 
-The binder applies stricter consent requirements for lower-trust tiers.
+`~/.openclaw/consent/policies.sqlite` (agent-global, not per-session). PRAGMA: `journal_mode=WAL`, `foreign_keys=ON`.
+
+#### Schema
+
+**`policies`** table:
+
+```sql
+CREATE TABLE policies (
+  id            TEXT PRIMARY KEY,
+  class         TEXT NOT NULL CHECK(class IN ('user', 'self-minted', 'system')),
+  effect_scope  TEXT NOT NULL,  -- JSON array of EffectClass
+  applicability TEXT NOT NULL,  -- JSON PolicyApplicabilityPredicate
+  escalation_rules TEXT NOT NULL, -- JSON EscalationRule[] (without function-typed conditions)
+  expiry        TEXT NOT NULL,  -- JSON PolicyExpiry
+  revocation_semantics TEXT NOT NULL CHECK(revocation_semantics IN ('immediate', 'after-current-slice')),
+  provenance    TEXT NOT NULL,  -- JSON PolicyProvenance
+  description   TEXT NOT NULL,
+  status        TEXT NOT NULL CHECK(status IN ('active', 'pending-confirmation', 'revoked', 'expired')),
+  created_at    INTEGER NOT NULL,
+  updated_at    INTEGER NOT NULL
+);
+
+CREATE INDEX idx_policies_status ON policies(status);
+CREATE INDEX idx_policies_class ON policies(class);
+```
+
+**`policy_usage`** table (tracks use counts for `maxUses` expiry):
+
+```sql
+CREATE TABLE policy_usage (
+  policy_id TEXT NOT NULL REFERENCES policies(id),
+  wo_id     TEXT NOT NULL,
+  used_at   INTEGER NOT NULL,
+  PRIMARY KEY (policy_id, wo_id)
+);
+
+CREATE INDEX idx_policy_usage_policy ON policy_usage(policy_id);
+```
+
+#### Store Interface
+
+```typescript
+export type PolicyStore = {
+  /** Insert a new policy. System policies are bulk-loaded at startup. */
+  insertPolicy(policy: StandingPolicy): void;
+  /** Get a policy by ID. */
+  getPolicy(id: string): StandingPolicy | undefined;
+  /** Get all active policies (status = "active"). */
+  getActivePolicies(): StandingPolicy[];
+  /** Get active policies filtered by class. */
+  getActivePoliciesByClass(policyClass: PolicyClass): StandingPolicy[];
+  /** Update policy status (activate, revoke, expire). */
+  updatePolicyStatus(id: string, status: PolicyStatus, updatedAt?: number): boolean;
+  /** Confirm a self-minted policy (sets confirmedAt and status = "active"). */
+  confirmPolicy(id: string, confirmedAt?: number): boolean;
+  /** Record a policy usage (for maxUses tracking). */
+  recordPolicyUsage(policyId: string, woId: string): void;
+  /** Get usage count for a policy. */
+  getPolicyUsageCount(policyId: string): number;
+  /** Expire policies that have exceeded their expiresAt or maxUses. */
+  expireStalePolices(now?: number): number;
+  /** Remove all policies (for testing). */
+  clearAll(): void;
+  /** Close the database connection. */
+  close(): void;
+};
+
+export type OpenPolicyStoreParams = {
+  dbPath: string;
+  injectedDb?: unknown;
+};
+
+export function openPolicyStore(params: OpenPolicyStoreParams): PolicyStore;
+export function resolveDefaultPolicyStorePath(): Promise<string>;
+```
+
+#### Serialization
+
+`EscalationCondition` with `kind: "custom"` includes a function-typed `evaluate` field. This is NOT persisted to SQLite. Custom escalation conditions are runtime-only and must be registered via code (system policies). Serialization strips `custom` conditions on write and restores them from the system policy registry on read.
+
+### 5c. Policy Evaluation in the Binder
+
+Modify `src/consent/binder.ts` to evaluate standing policies during WO minting. This is the core integration point.
+
+#### Policy Application Order (Precedence)
+
+In both `mintInitialWorkOrder` and `mintSuccessorWorkOrder`, policies are applied in this order:
+
+1. **System prohibitions** -- effects in `systemProhibitions` are removed unconditionally (unchanged from Phase 1)
+2. **System policies (inviolable restrictions)** -- system-class policies with `status: "active"` can further restrict the grant set. System policies that _grant_ effects serve as pre-authorized consent anchors.
+3. **User policies** -- user-class policies with `status: "active"` expand the grant set by providing consent anchors for their `effectScope`. The policy's applicability predicate must match the current context.
+4. **Self-minted policies** -- only if `status: "active"` (which requires `confirmedAt` to be set). Same applicability matching as user policies.
+5. **Escalation rules** -- even if a policy would grant consent, escalation rules can force a CO or EAA invocation instead.
+
+#### Binder Changes
+
+**`mintInitialWorkOrder`**: currently accepts `policies: readonly StandingPolicyStub[]` and ignores them. Change to:
+
+```typescript
+export function mintInitialWorkOrder(input: BinderMintInput): BinderResult {
+  const { po, policies, systemProhibitions } = input;
+
+  const prohibited = new Set<EffectClass>(systemProhibitions);
+
+  // Phase 5: apply system policy prohibitions
+  const systemPolicies = policies.filter(
+    (p) => isFullStandingPolicy(p) && p.class === "system" && p.status === "active",
+  );
+  for (const sp of systemPolicies) {
+    if (isFullStandingPolicy(sp)) {
+      // System policies that restrict: add their scoped effects to prohibited set
+      // when the policy has escalation rules that refuse
+      for (const rule of sp.escalationRules) {
+        if (rule.action === "refuse") {
+          // This policy explicitly prohibits certain effect combinations
+          // handled at evaluation time, not here
+        }
+      }
+    }
+  }
+
+  // Derive grants from implied effects, minus prohibited
+  const implied = po.impliedEffects.filter((e) => !prohibited.has(e));
+
+  // Phase 5: augment with policy-granted effects
+  const policyAnchors: ConsentAnchor[] = [];
+  const policyGrantedEffects: EffectClass[] = [];
+
+  const applicablePolicies = filterApplicablePolicies(policies, {
+    channel: po.channel,
+    chatType: po.chatType,
+    senderId: po.senderId,
+    senderIsOwner: po.senderIsOwner,
+  });
+
+  for (const policy of applicablePolicies) {
+    if (!isFullStandingPolicy(policy)) continue;
+    if (policy.class === "system") continue; // system handled above
+    if (policy.status !== "active") continue;
+    if (isExpired(policy.expiry)) continue;
+
+    // Check escalation rules before granting
+    const escalated = evaluateEscalationRules(policy.escalationRules /* context */);
+    if (escalated) continue; // skip this policy; escalation handler will deal with it
+
+    for (const effect of policy.effectScope) {
+      if (!prohibited.has(effect) && !implied.includes(effect)) {
+        policyGrantedEffects.push(effect);
+      }
+    }
+    policyAnchors.push({ kind: "policy", policyId: policy.id });
+  }
+
+  const granted = [...new Set([...implied, ...policyGrantedEffects])];
+  // ... rest of minting logic with policyAnchors added to consentAnchors
+}
+```
+
+**`verifyConsentAnchorAgainstRecords`**: the `case "policy"` branch currently stub-accepts. Replace with:
+
+```typescript
+case "policy": {
+  // Phase 5: verify the referenced policy exists, is active, and covers needed effects
+  // Policy verification requires the policy store, which is passed as an optional param.
+  // When no store is available (backward compat), accept the anchor.
+  if (!policyStore) return { valid: true };
+
+  const policy = policyStore.getPolicy(anchor.policyId);
+  if (!policy) {
+    return { valid: false, reason: `Policy ${anchor.policyId} not found` };
+  }
+  if (policy.status !== "active") {
+    return { valid: false, reason: `Policy ${anchor.policyId} is ${policy.status}` };
+  }
+  if (isExpired(policy.expiry)) {
+    return { valid: false, reason: `Policy ${anchor.policyId} has expired` };
+  }
+  const policyEffects = new Set(policy.effectScope);
+  const uncovered = neededEffects.filter((e) => !policyEffects.has(e));
+  if (uncovered.length > 0) {
+    return {
+      valid: false,
+      reason: `Policy does not cover effects: [${uncovered.join(", ")}]`,
+    };
+  }
+  return { valid: true };
+}
+```
+
+#### Helper Functions in policy.ts
+
+```typescript
+/** Filter policies whose applicability predicate matches the current context. */
+export function filterApplicablePolicies(
+  policies: readonly (StandingPolicyStub | StandingPolicy)[],
+  context: PolicyMatchContext,
+): StandingPolicy[];
+
+export type PolicyMatchContext = {
+  channel?: string;
+  chatType?: string;
+  senderId: string;
+  senderIsOwner: boolean;
+  toolName?: string;
+  toolTrustTier?: TrustTier;
+  currentHour?: number;
+};
+
+/** Check whether a policy's expiry conditions have been met. */
+export function isExpired(expiry: PolicyExpiry, now?: number): boolean;
+
+/** Evaluate escalation rules against the current context. Returns the first matching rule or undefined. */
+export function evaluateEscalationRules(
+  rules: EscalationRule[],
+  context: EscalationContext,
+): EscalationRule | undefined;
+
+/** Increment a policy's usage count and check maxUses. Returns true if still valid. */
+export function recordAndCheckUsage(
+  policy: StandingPolicy,
+  woId: string,
+  store: PolicyStore,
+): boolean;
+```
+
+### 5d. Default System Policies
+
+Hardcoded system policies loaded at startup. These encode the framework's non-negotiable safety boundaries. They supplement (not replace) the `DEFAULT_DUTY_CONSTRAINTS` from Phase 4a.
+
+```typescript
+export const DEFAULT_SYSTEM_POLICIES: readonly StandingPolicy[] = [
+  {
+    id: "system-policy-read-compose",
+    class: "system",
+    effectScope: ["read", "compose"],
+    applicability: {},
+    escalationRules: [],
+    expiry: { currentUses: 0 },
+    revocationSemantics: "immediate",
+    provenance: { author: "system", createdAt: 0 },
+    description: "Read and compose are always permitted as baseline capabilities.",
+    status: "active",
+  },
+  {
+    id: "system-policy-no-physical-without-eaa",
+    class: "system",
+    effectScope: ["physical"],
+    applicability: {},
+    escalationRules: [
+      {
+        condition: { kind: "effect-combination", effects: ["physical"] },
+        action: "trigger-eaa",
+        description: "Physical effects always require EAA deliberation.",
+      },
+    ],
+    expiry: { currentUses: 0 },
+    revocationSemantics: "immediate",
+    provenance: { author: "system", createdAt: 0 },
+    description: "Physical actuation always triggers EAA regardless of other consent.",
+    status: "active",
+  },
+  {
+    id: "system-policy-no-elevated-from-non-owner",
+    class: "system",
+    effectScope: ["elevated"],
+    applicability: { requireOwner: true },
+    escalationRules: [
+      {
+        condition: { kind: "trust-tier-below", tier: "in-process" },
+        action: "refuse",
+        description: "External tools cannot perform elevated operations.",
+      },
+    ],
+    expiry: { currentUses: 0 },
+    revocationSemantics: "immediate",
+    provenance: { author: "system", createdAt: 0 },
+    description:
+      "Elevated operations restricted to owner-initiated requests with in-process tools.",
+    status: "active",
+  },
+];
+```
+
+### 5e. Self-Minted Policy Proposal
+
+When the agent detects repeated consent patterns (same effects being CO-granted across multiple requests), it can propose a standing policy. This leverages the consent record store's precedent search from Phase 3c.
+
+Create `src/consent/policy-proposal.ts`:
+
+```typescript
+export type PolicyProposalParams = {
+  consentRecordStore: ConsentRecordStore;
+  /** Minimum number of times the same effect set must be granted before proposal. */
+  minRepetitions: number;
+  /** Time window to look back for repeated grants. */
+  lookbackMs: number;
+  /** Current agent and context for policy scoping. */
+  agentId: string;
+  channel?: string;
+};
+
+export type PolicyProposal = {
+  suggestedPolicy: StandingPolicy;
+  /** Evidence: the consent records that motivated this proposal. */
+  evidenceRecordIds: string[];
+  /** Human-readable rationale for the user. */
+  rationale: string;
+};
+
+/**
+ * Analyze recent consent records for repeated grant patterns that suggest
+ * a standing policy would reduce friction without compromising safety.
+ *
+ * Only proposes policies for non-high-risk effect sets. Never proposes
+ * policies that would cover irreversible, physical, or elevated effects
+ * without explicit escalation rules.
+ */
+export function analyzeForPolicyProposals(params: PolicyProposalParams): PolicyProposal[];
+
+/**
+ * Convert a policy proposal to a pending self-minted StandingPolicy.
+ * The policy is created with status "pending-confirmation" and requires
+ * user confirmation via confirmPolicy() before it can be used as a
+ * consent anchor.
+ */
+export function createSelfMintedPolicy(
+  proposal: PolicyProposal,
+  store: PolicyStore,
+): StandingPolicy;
+```
+
+#### Safety Constraints on Self-Minted Policies
+
+- Never auto-propose policies covering `HIGH_RISK_EFFECTS` (irreversible, elevated, disclose, audience-expand, exec, physical) without escalation rules that trigger EAA
+- Self-minted policies always start as `status: "pending-confirmation"`
+- Maximum expiry of 30 days (configurable) -- self-minted policies are not permanent
+- Maximum 100 uses before re-confirmation required
+- The confirmation prompt displays the full effect scope, applicability conditions, and the evidence records that motivated the proposal
+
+### 5f. Dynamic Skill Trust Tiers for Plugin Tools
+
+Extend plugin manifest (`openclaw.plugin.json`) and tool registration to declare `trustTier`. The trust tier affects how the binder treats policies and how EAA triggers evaluate tools.
+
+#### Plugin Manifest Extension
+
+In plugin manifest schema, add optional `trustTier` at the tool level:
+
+```json
+{
+  "tools": [
+    {
+      "name": "my-tool",
+      "trustTier": "sandboxed"
+    }
+  ]
+}
+```
+
+#### Registration Flow
+
+1. Plugin calls `api.registerTool(tool, { effectProfile: { effects: [...], trustTier: "external" } })` -- unchanged from Phase 2
+2. If `trustTier` is not explicitly declared, the system derives it:
+   - Tools from bundled workspace plugins → `in-process`
+   - Tools from installed npm plugins → `sandboxed`
+   - Tools with MCP transport → `external`
+3. The derived tier is set during `resolvePluginTools` in `src/plugins/tools.ts`
+
+#### Trust Tier Impact on Consent
+
+| Trust Tier | Policy-Grantable?    | EAA Threshold | CO Required For         |
+| ---------- | -------------------- | ------------- | ----------------------- |
+| in-process | Yes                  | Standard      | High-risk effects only  |
+| sandboxed  | Yes                  | Lowered       | persist, exec, disclose |
+| external   | Only with escalation | Always lower  | All non-read effects    |
+
+Implementation: the binder checks `toolProfile.trustTier` (from registry or explicit) during `mintSuccessorWorkOrder`. For `external` tools, policy-based consent anchors are only accepted if the policy has an escalation rule covering the tool's trust tier (preventing external tools from silently consuming broad user policies).
+
+### 5g. Pattern Store Reuse for Policy Matching
+
+Leverage the consent pattern store from Phase 3a for natural-language policy matching. When a user creates a standing policy with a natural-language description, the system embeds the description and stores it alongside the policy.
+
+#### Use Cases
+
+1. **Policy search**: "Do I have a policy that covers file deletion?" → vector similarity search against policy descriptions
+2. **Policy conflict detection**: before activating a new policy, search for existing active policies whose effect scopes overlap and whose descriptions are semantically similar → surface potential conflicts to the user
+3. **CO-to-policy promotion**: when a CO is granted for effects that a policy could cover, suggest policy creation using the CO's `effectDescription` as the seed text
+
+#### Implementation
+
+Add optional embedding support to the policy store:
+
+```typescript
+// In policy-store.ts
+export type PolicyStoreWithEmbeddings = PolicyStore & {
+  /** Store an embedding for a policy (for semantic search). */
+  upsertPolicyEmbedding(policyId: string, embedding: Float32Array): void;
+  /** Find policies semantically similar to a query embedding. */
+  findSimilarPolicies(
+    embedding: Float32Array,
+    topK?: number,
+    threshold?: number,
+  ): Array<{
+    policy: StandingPolicy;
+    distance: number;
+  }>;
+};
+```
+
+This follows the same `sqlite-vec` pattern established in Phase 3a's `implied-consent-store.ts` and Phase 3c's `consent-store.ts`.
+
+### 5h. Configuration Surface
+
+Extend `ConsentConfig` in `src/config/types.openclaw.ts`:
+
+```typescript
+export type ConsentConfig = {
+  impliedEffects?: {
+    /* existing Phase 3a config */
+  };
+  policies?: {
+    /** Enable standing policy framework. Default: false (Phase 5 opt-in). */
+    enabled?: boolean;
+    /** Path to policy store SQLite database. Default: auto-resolved. */
+    storePath?: string;
+    /** Maximum expiry for self-minted policies (ms). Default: 30 days. */
+    selfMintedMaxExpiryMs?: number;
+    /** Minimum CO grant repetitions before self-minted policy proposal. Default: 3. */
+    selfMintedMinRepetitions?: number;
+    /** Lookback window for self-minted policy analysis (ms). Default: 7 days. */
+    selfMintedLookbackMs?: number;
+    /** Enable policy embedding for semantic search. Default: false. */
+    enableEmbeddings?: boolean;
+  };
+};
+```
+
+Add matching Zod schema in `src/config/zod-schema.ts`.
+
+### 5i. Integration into Existing Pipeline
+
+#### initializeConsentForRun (integration.ts)
+
+When `consent.policies.enabled` is true:
+
+1. Open the policy store at startup (or use singleton)
+2. Load active policies
+3. Expire stale policies (`expireStalePolices`)
+4. Pass active policies to `mintInitialWorkOrder` instead of `[]`
+
+#### handleConsentFailure (eaa-integration.ts)
+
+Before creating a standard CO:
+
+1. Check if any active standing policy covers the missing effects
+2. If yes and applicability matches → use the policy as a consent anchor, mint successor WO
+3. If yes but escalation rules fire → route to EAA or CO per the escalation rule's action
+4. If no → proceed with existing CO/EAA flow
+
+#### mintSuccessorWithAnchor (eaa-integration.ts)
+
+Pass the active policies to `mintSuccessorWorkOrder` so the binder can verify policy anchors.
+
+### 5j. Test Plan
+
+| Test Area                   | Expected Tests | Coverage                                                                                    |
+| --------------------------- | -------------- | ------------------------------------------------------------------------------------------- |
+| Policy type validation      | 10-12          | PolicyApplicabilityPredicate matching, expiry checks, escalation evaluation                 |
+| Policy store CRUD           | 15-18          | Insert, get, update status, confirm, usage tracking, expiry, clear                          |
+| Binder policy evaluation    | 15-20          | Policy-augmented minting, precedence order, escalation override, policy anchor verification |
+| Default system policies     | 5-8            | Read/compose baseline, physical-EAA escalation, elevated-owner restriction                  |
+| Self-minted policy proposal | 8-10           | Repetition detection, high-risk exclusion, pending-confirmation status, evidence linking    |
+| Trust tier derivation       | 6-8            | Explicit declaration, derived from plugin source, impact on consent requirements            |
+| Pattern store reuse         | 5-8            | Policy embedding, semantic search, conflict detection                                       |
+| Integration (pipeline)      | 8-12           | Policy-loaded initialization, handleConsentFailure policy bypass, end-to-end flow           |
+
+**Estimated total: ~75-95 tests.**
+
+### Key Files Created/Modified (Phase 5)
+
+**New files** (under `src/consent/`):
+
+- `policy.ts` -- StandingPolicy types, applicability matching, escalation evaluation, type guards, default system policies (~500 LOC)
+- `policy-store.ts` -- SQLite persistence for policies, usage tracking, optional embedding support (~450 LOC)
+- `policy-proposal.ts` -- Self-minted policy analysis and creation from consent record patterns (~250 LOC)
+- `policy.test.ts` -- Policy type validation, matching, escalation (~300 LOC)
+- `policy-store.test.ts` -- Store CRUD, expiry, usage tracking (~350 LOC)
+- `policy-proposal.test.ts` -- Proposal analysis, safety constraints (~250 LOC)
+
+**Modified files**:
+
+- `src/consent/types.ts` -- Keep `StandingPolicyStub` (backward compat), no changes needed
+- `src/consent/binder.ts` -- Policy evaluation in `mintInitialWorkOrder` and `mintSuccessorWorkOrder`, policy anchor verification in `verifyConsentAnchorAgainstRecords`
+- `src/consent/integration.ts` -- Load policies from store, pass to binder
+- `src/consent/eaa-integration.ts` -- Policy check before CO creation, pass policies to `mintSuccessorWithAnchor`
+- `src/consent/index.ts` -- Barrel updated with Phase 5 exports
+- `src/config/types.openclaw.ts` -- `consent.policies` config section
+- `src/config/zod-schema.ts` -- Zod validation for policies config
+- `docs/.generated/config-baseline.json` -- Regenerated for policy config additions
+- `docs/.generated/config-baseline.jsonl` -- Regenerated for policy config additions
 
 ---
 
@@ -740,15 +1352,26 @@ flowchart TD
     P3a --> P3c["Phase 3c: Consent record persistence + precedent reuse ✅"]
     P3b --> P3d["Phase 3d: Revocation and withdrawal ✅"]
     P3c --> P3d
-    P3d --> P4a["Phase 4a: EAA trigger detection (7 categories, uses 3b ambiguity score)"]
-    P4a --> P4b["Phase 4b: EAA adjudication loop (6-step classify→artifacts)"]
-    P4b --> P4c["Phase 4c: Pipeline integration (consent failure → EAA/CO routing)"]
-    P4c --> P4d["Phase 4d: System prompt updates (consent-aware agent behavior)"]
-    P4d --> P5["Phase 5: Standing policies + trust tiers"]
-    P5 --> P6["Phase 6: Observability, receipts, metrics"]
+    P3d --> P4a["Phase 4a: EAA trigger detection ✅"]
+    P4a --> P4b["Phase 4b: EAA adjudication loop ✅"]
+    P4b --> P4c["Phase 4c: Pipeline integration ✅"]
+    P4c --> P4d["Phase 4d: System prompt updates ✅"]
+    P4d --> P5a["Phase 5a: Policy type system + backward compat"]
+    P5a --> P5b["Phase 5b: Policy store (SQLite persistence)"]
+    P5a --> P5d["Phase 5d: Default system policies"]
+    P5b --> P5c["Phase 5c: Binder policy evaluation"]
+    P5d --> P5c
+    P5c --> P5e["Phase 5e: Self-minted policy proposal"]
+    P5c --> P5f["Phase 5f: Dynamic trust tiers"]
+    P5c --> P5i["Phase 5i: Pipeline integration"]
+    P5e --> P5g["Phase 5g: Pattern store reuse for policy matching"]
+    P5i --> P5h["Phase 5h: Config surface + Zod schema"]
+    P5h --> P6["Phase 6: Observability, receipts, metrics"]
+    P5g --> P6
+    P5f --> P6
 ```
 
-Phases 0-2 are foundational and sequential. Phase 3 (completed) provides the consent pattern store, change order flow, consent record persistence, and revocation machinery. Phase 4a depends on 3b's `assessRequestAmbiguity` for the effect-ambiguity trigger. Phase 4b-4c can proceed incrementally. Phase 4d (system prompt) can be done in parallel with 4b-4c since it is purely additive text. Phase 5 can optionally reuse the pattern store for standing policy matching.
+Phases 0-2 are foundational and sequential. Phase 3 (completed) provides the consent pattern store, change order flow, consent record persistence, and revocation machinery. Phase 4 (completed) provides EAA trigger detection, adjudication, orchestration integration, and system prompt updates. Phase 5 is decomposed into sub-phases: 5a (types) is the foundation; 5b (store) and 5d (defaults) can proceed in parallel once 5a lands; 5c (binder integration) requires both 5b and 5d; 5e (self-minted proposals), 5f (trust tiers), and 5i (pipeline integration) depend on 5c; 5g (pattern store reuse) depends on 5e; 5h (config) depends on 5i. Phase 5f (trust tiers) only requires 5c and can proceed in parallel with 5e and 5i.
 
 ---
 
@@ -771,7 +1394,9 @@ Phases 0-2 are foundational and sequential. Phase 3 (completed) provides the con
 - `eaa-triggers.ts` -- EAA trigger detection with 7 trigger categories (Phase 4a)
 - `eaa.ts` -- EAA adjudication loop: classify, discover, evaluate, select, outcome, artifacts (Phase 4b)
 - `eaa-integration.ts` -- Orchestration wiring: consent failure → EAA/CO routing (Phase 4c)
-- `policy.ts` -- Standing policies with bounding boxes (Phase 5)
+- `policy.ts` -- StandingPolicy types, applicability matching, escalation evaluation, default system policies (Phase 5a/5c/5d)
+- `policy-store.ts` -- SQLite persistence for policies, usage tracking, optional embedding support (Phase 5b)
+- `policy-proposal.ts` -- Self-minted policy analysis and creation from consent record patterns (Phase 5e)
 - `events.ts` -- Scope chain event model (Phase 6)
 - `remediation.ts` -- Breach containment + remediation protocol (Phase 6)
 
