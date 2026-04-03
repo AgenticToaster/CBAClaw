@@ -1,16 +1,15 @@
-# CBA Phase 3 Implementation Summary (3a Complete)
+# CBA Phase 3 Implementation Summary (Complete)
 
-Token-optimized handoff for Phase 3b/3c/3d and Phase 4 implementation.
+Token-optimized handoff for Phase 4 implementation.
 
 ## Repo Context
 
 - Repo: CBAClaw (fork of openclaw/openclaw)
-- CBA module: `src/consent/` (Phase 0-1 types/binder/scope-chain + Phase 2 integration + Phase 3a implied consent)
-- Phase 3a replaces the static `["read", "compose"]` default with vector-based + heuristic implied consent derivation
-- Tests: `npx vitest run src/consent/` — 148 passing, 16 skipped (sqlite-vec not in test env)
+- CBA module: `src/consent/` (Phase 0-1 types/binder/scope-chain + Phase 2 integration + Phase 3 implied consent, change orders, consent records, revocation)
+- Tests: `npx vitest run src/consent/` — 220 passing, 16 skipped (sqlite-vec not in test env)
 - Prior summaries: `plans/phase-0-1-summary.md`, `plans/phase-2-summary.md`
 
-## Files Delivered (Phase 3a)
+## Files Delivered (Phase 3a — Implied Consent Derivation)
 
 ### New Files
 
@@ -48,7 +47,58 @@ docs/.generated/
   config-baseline.jsonl  # Regenerated for consent schema addition
 ```
 
-## Architecture Overview
+## Files Delivered (Phase 3b — Change Order Flow)
+
+### New Files
+
+```
+src/consent/
+  change-order.ts        # CO lifecycle: request, resolve, expire, withdraw, ambiguity detection (443 LOC)
+  change-order.test.ts   # 28 tests
+```
+
+### Modified Files
+
+```
+src/consent/
+  index.ts               # Barrel updated with Phase 3b exports
+```
+
+## Files Delivered (Phase 3c — Consent Record Persistence)
+
+### New Files
+
+```
+src/consent/
+  consent-store.ts       # Per-session SQLite store for ConsentRecord + EAARecord (611 LOC)
+  consent-store.test.ts  # 25 tests
+```
+
+### Modified Files
+
+```
+src/consent/
+  index.ts               # Barrel updated with Phase 3c exports
+```
+
+## Files Delivered (Phase 3d — Revocation and Withdrawal)
+
+### New Files
+
+```
+src/consent/
+  revocation.ts          # User revocation, agent withdrawal, session reset (366 LOC)
+  revocation.test.ts     # 19 tests
+```
+
+### Modified Files
+
+```
+src/consent/
+  index.ts               # Barrel updated with Phase 3d exports
+```
+
+## Phase 3a Architecture
 
 ```
 Request text
@@ -70,7 +120,220 @@ deriveImpliedEffects()  ◄── entry point (implied-consent.ts)
     Fallback chain: vector failure → heuristic → ["read", "compose"]
 ```
 
-## implied-consent-seed.ts
+## Phase 3b Architecture: Change Order Flow
+
+```
+verifyToolConsent() → "effect-not-granted"
+    │
+    ▼
+requestChangeOrder()
+    │
+    ├── findPatternsForEffects()    ◄── reverse pattern lookup for description
+    ├── generateEffectDescription() ◄── human-readable CO approval text
+    ├── assessRequestAmbiguity()    ◄── vector distance ambiguity signal
+    │
+    ▼
+ChangeOrder { id, status: "pending", requestedEffects, effectDescription }
+    │
+    ├── UI/gateway surface presents CO to user
+    │
+    ▼
+resolveChangeOrder()
+    │
+    ├── decision: "denied"  → agent replans within current WO
+    │
+    └── decision: "granted"
+         ├── addConsentRecord()  ◄── explicit consent anchor
+         ├── verifyConsentAnchorAgainstRecords()
+         ├── mintSuccessorWorkOrder()  ◄── WO' with expanded grants
+         ├── transitionWorkOrder()  ◄── scope chain updated
+         └── return successorWO for tool retry
+```
+
+### change-order.ts
+
+#### Constants
+
+| Constant                      | Value                                                                                                     |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `DEFAULT_AMBIGUITY_THRESHOLD` | 0.6                                                                                                       |
+| `EFFECT_DESCRIPTIONS`         | Record<EffectClass, string> — human-readable per-effect descriptions                                      |
+| `HIGH_RISK_EFFECTS`           | Set of 6 elevated-risk effect classes (irreversible, elevated, disclose, audience-expand, exec, physical) |
+
+#### Exported Types
+
+- **`AmbiguityAssessment`**: `{ ambiguous: boolean, bestDistance: number, matchCount: number }`
+- **`RequestChangeOrderParams`**: `{ currentWO, po, missingEffects, toolName, toolEffectProfile?, reason, patternStore?, ambiguity? }`
+- **`RequestChangeOrderResult`**: `{ ok: true, changeOrder } | { ok: false, reason }`
+- **`ResolveChangeOrderParams`**: `{ changeOrderId, decision: "granted" | "denied", constraints?, consentExpiresInMs? }`
+- **`ResolveChangeOrderResult`**: `{ ok: true, changeOrder, successorWO? } | { ok: false, reason }`
+
+#### Exported Functions
+
+| Function                    | Signature                                                     | Description                                                           |
+| --------------------------- | ------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `findPatternsForEffects`    | `(store, effects, limit?) → PatternSearchResult[]`            | Reverse lookup: find patterns whose effects overlap requested effects |
+| `generateEffectDescription` | `(missingEffects, patternExamples?, ambiguityInfo?) → string` | Builds human-readable CO description without LLM                      |
+| `assessRequestAmbiguity`    | `(params) → Promise<AmbiguityAssessment>`                     | Vector distance-based ambiguity detection                             |
+| `requestChangeOrder`        | `(params) → RequestChangeOrderResult`                         | Creates pending CO with effect description                            |
+| `resolveChangeOrder`        | `(params) → ResolveChangeOrderResult`                         | Resolves CO: grant mints successor WO, deny removes CO                |
+| `getPendingChangeOrder`     | `(id) → ChangeOrder \| undefined`                             | Lookup pending CO by ID                                               |
+| `getAllPendingChangeOrders` | `() → ChangeOrder[]`                                          | All pending COs                                                       |
+| `expireChangeOrder`         | `(id) → boolean`                                              | Timeout expiry for stale COs                                          |
+| `withdrawChangeOrder`       | `(id) → boolean`                                              | Agent-initiated CO cancellation                                       |
+
+#### Testing Seam (`__testing`)
+
+`clearPendingOrders()`, `pendingOrderCount`, `EFFECT_DESCRIPTIONS`, `HIGH_RISK_EFFECTS`, `DEFAULT_AMBIGUITY_THRESHOLD`
+
+## Phase 3c Architecture: Consent Record Persistence
+
+```
+ConsentRecord / EAARecord
+    │
+    ▼
+ConsentRecordStore (SQLite, per-session)
+    │
+    ├── insertConsentRecord() / insertEAARecord()
+    ├── getConsentRecord() / getEAARecord()
+    ├── getConsentRecordsByPO() / getConsentRecordsByDecision()
+    ├── updateConsentDecision()  ◄── revocation updates
+    ├── findConsentPrecedent()   ◄── exact effect-set match, non-expired
+    ├── findSimilarConsentPrecedent()  ◄── vec0 embedding similarity
+    ├── upsertConsentEmbedding()
+    └── clearAll()  ◄── session reset
+```
+
+### consent-store.ts
+
+#### Database
+
+Location: `~/.openclaw/agents/<agentId>/consent/consent-records.sqlite` (700/600 perms).
+
+PRAGMA: `journal_mode=WAL`, `foreign_keys=ON`.
+
+#### Schema
+
+**`meta`** — key-value store for schema version.
+
+**`consent_records`**:
+
+```
+id TEXT PRIMARY KEY
+po_id TEXT NOT NULL (indexed)
+wo_id TEXT NOT NULL
+effect_classes TEXT NOT NULL (JSON array of EffectClass)
+decision TEXT NOT NULL (indexed) — "granted" | "denied" | "revoked"
+timestamp INTEGER NOT NULL
+expires_at INTEGER (nullable)
+metadata TEXT (nullable, JSON)
+```
+
+**`eaa_records`**:
+
+```
+id TEXT PRIMARY KEY
+po_id TEXT NOT NULL (indexed)
+wo_id TEXT NOT NULL
+trigger_reason TEXT NOT NULL
+outcome TEXT NOT NULL
+recommended_effects TEXT NOT NULL (JSON array)
+recommended_constraints TEXT NOT NULL (JSON array)
+created_at INTEGER NOT NULL
+reasoning TEXT (nullable)
+```
+
+**`consent_embeddings`** — vec0 virtual table (optional, requires sqlite-vec):
+
+```
+record_id TEXT PRIMARY KEY
+embedding float[<DIM>] distance_metric=cosine
+```
+
+#### Exported Types
+
+- **`ConsentRecordStore`**: interface with all CRUD + precedent search + clear + close methods
+- **`OpenConsentRecordStoreParams`**: `{ dbPath, embeddingDimension?, injectedDb?, skipVecExtension? }`
+
+#### Exported Functions
+
+| Function                               | Signature                                | Description                                           |
+| -------------------------------------- | ---------------------------------------- | ----------------------------------------------------- |
+| `openConsentRecordStore`               | `(params) → Promise<ConsentRecordStore>` | Opens/creates store, loads sqlite-vec, ensures schema |
+| `resolveConsentRecordStorePath`        | `(stateDir, agentId) → string`           | Deterministic path resolution                         |
+| `resolveDefaultConsentRecordStorePath` | `(agentId) → Promise<string>`            | Uses config's resolveStateDir                         |
+
+#### Precedent Reuse
+
+**Exact match** (`findConsentPrecedent`): queries granted records ordered by `timestamp DESC`, returns the first whose effect set is a superset of the requested effects and is not expired.
+
+**Similarity search** (`findSimilarConsentPrecedent`): queries vec0 embeddings for the k-nearest consent record embeddings, filters by distance threshold + decision="granted" + non-expired + effect superset. Threshold default: 0.25.
+
+## Phase 3d Architecture: Revocation and Withdrawal
+
+```
+User "/cancel" or session reset
+    │
+    ├── revokeConsent({ scope: "all" | "effects", effects? })
+    │       ├── Mark matching granted records as "revoked" (in-memory + persistent store)
+    │       ├── Add revocation audit ConsentRecord
+    │       ├── Mint restricted WO (read-only baseline)
+    │       │   └── systemProhibitions = revokedEffects \ {"read"}
+    │       └── transitionWorkOrder(restrictedWO)
+    │
+    ├── resetConsentSession(persistentStore?)
+    │       ├── Clear all in-memory consent + EAA records
+    │       └── Clear persistent store if provided
+    │
+    └── Agent self-assessment
+         │
+         ▼
+    withdrawCommitment({ withdrawalReason, explanation, affectedEffects? })
+            ├── Add withdrawal audit ConsentRecord (metadata.source = "agent-withdrawal")
+            ├── Compute remaining effects after withdrawal
+            ├── Mint restricted WO preserving "read" as minimum
+            │   └── systemProhibitions = affectedEffects \ {"read"}
+            ├── transitionWorkOrder(restrictedWO)
+            └── Return structured explanation to user
+```
+
+### revocation.ts
+
+#### Exported Types
+
+- **`RevocationScope`**: `"all" | "effects"`
+- **`RevokeConsentParams`**: `{ scope, effects?, reason?, persistentStore? }`
+- **`RevocationResult`**: `{ ok: true, restrictedWO, revokedRecordCount } | { ok: false, reason }`
+- **`WithdrawalReason`**: `"constraint-change" | "duty-conflict" | "capability-insufficient" | "safety-concern" | "other"`
+- **`WithdrawCommitmentParams`**: `{ withdrawalReason, explanation, affectedEffects?, persistentStore? }`
+- **`WithdrawalResult`**: `{ ok: true, restrictedWO, explanation } | { ok: false, reason }`
+- **`SessionResetResult`**: `{ clearedRecords, clearedEAARecords }`
+
+#### Exported Functions
+
+| Function              | Signature                                 | Description                                                      |
+| --------------------- | ----------------------------------------- | ---------------------------------------------------------------- |
+| `revokeConsent`       | `(params) → RevocationResult`             | User revocation: invalidates WO, transitions to restricted scope |
+| `withdrawCommitment`  | `(params) → WithdrawalResult`             | Agent withdrawal: narrows scope, explains to user                |
+| `resetConsentSession` | `(persistentStore?) → SessionResetResult` | Clears all consent state for session                             |
+
+#### Key Design: Read Baseline Preservation
+
+Both `revokeConsent` and `withdrawCommitment` always preserve `"read"` as a minimum effect. When constructing `systemProhibitions`, `"read"` is filtered out so the agent can always communicate refusals. The restricted PO is minted with `impliedEffects: ["read"]` (revocation) or `impliedEffects: minimalEffects` (withdrawal, which always includes "read").
+
+#### Withdrawal Descriptions
+
+| Reason                    | Description                                                                   |
+| ------------------------- | ----------------------------------------------------------------------------- |
+| `constraint-change`       | Operating constraints have changed since the original commitment.             |
+| `duty-conflict`           | Continuing would create a conflict between competing obligations.             |
+| `capability-insufficient` | The agent lacks the capability or authorization to complete this work safely. |
+| `safety-concern`          | Continuing poses a safety or integrity risk that cannot be mitigated.         |
+| `other`                   | The agent is unable to continue with the current scope of work.               |
+
+## Phase 3a Details (Reference)
+
+### implied-consent-seed.ts
 
 95 curated canonical patterns organized by primary effect category:
 
@@ -86,9 +349,7 @@ deriveImpliedEffects()  ◄── entry point (implied-consent.ts)
 | Audience-expand | 4     | "Broadcast the announcement to all channels" | [audience-expand, disclose]    |
 | Compound        | 11    | "Write a script and run it"                  | [read, compose, persist, exec] |
 
-Exported as `CONSENT_SEED_PATTERNS: readonly ConsentSeedEntry[]`. Each entry: `{ text: string, effects: readonly EffectClass[] }`.
-
-## implied-consent-heuristic.ts
+### implied-consent-heuristic.ts
 
 8 keyword/regex rules with `\b` word boundaries and `/i` case-insensitive matching:
 
@@ -103,244 +364,72 @@ Exported as `CONSENT_SEED_PATTERNS: readonly ConsentSeedEntry[]`. Each entry: `{
 | Elevated           | cron, schedule, gateway, admin, configure system, webhook, ... | [elevated]               |
 | Physical           | turn on/off, actuate, motor, servo, gpio, hardware, ...        | [physical]               |
 
-Default (no match): `["read", "compose"]`. When any rule matches, `read` and `compose` are always included.
+### implied-consent-store.ts
 
-Exported: `deriveEffectsFromHeuristic(requestText: string): EffectClass[]`.
+Store API, schema, and functions documented in Phase 3a delivery above.
 
-## implied-consent-store.ts
+### implied-consent.ts (Orchestrator)
 
-### Database
+Mode/config/function details documented in Phase 3a delivery above.
 
-Location: `~/.openclaw/consent/consent-patterns.sqlite` (700/600 perms).
+### integration.ts Changes
 
-PRAGMA: `journal_mode=WAL`, `foreign_keys=ON`.
+`initializeConsentForRun` is now `async`. When `params.impliedEffects` is not provided, it dynamically imports `deriveImpliedEffects` and derives effects from the request text. On failure, falls back to `["read", "compose"]`.
 
-### Schema
+## Test Summary (Full Phase 3)
 
-**`meta`** — key-value store for schema version and embedding dimension.
+| File                              | Tests | Skipped | Coverage                                                                 |
+| --------------------------------- | ----- | ------- | ------------------------------------------------------------------------ |
+| implied-consent-heuristic.test.ts | 15    | 0       | All 8 rules, compounds, case, dedup, defaults                            |
+| implied-consent-store.test.ts     | 13    | 11      | Schema, CRUD, vector search, threshold, dim validation, seed             |
+| implied-consent.test.ts           | 8     | 5       | Vector derivation, both-mode merging, fallback, heuristic-only           |
+| integration.test.ts               | 17    | 0       | PO, enforcement, init (async), verify, e2e, fallback                     |
+| change-order.test.ts              | 28    | 0       | CO creation, grant/deny, successor WO, expiry, ambiguity, pattern lookup |
+| consent-store.test.ts             | 25    | 0       | CRUD, round-trip, precedent matching, expiry filtering, clear            |
+| revocation.test.ts                | 19    | 0       | Revoke all/targeted, withdrawal reasons, session reset, persistent store |
 
-**`patterns`** — canonical request text patterns:
+**Total: 220 passing, 16 skipped** (skipped tests require sqlite-vec native extension).
 
-```
-id INTEGER PRIMARY KEY AUTOINCREMENT
-text TEXT NOT NULL (unique index)
-effects TEXT NOT NULL (JSON array of EffectClass strings)
-source TEXT NOT NULL DEFAULT 'seed' ('seed' | 'learned' | 'admin')
-confidence REAL NOT NULL DEFAULT 1.0
-created_at INTEGER NOT NULL
-updated_at INTEGER NOT NULL
-```
+## Design Decisions (Phase 3b/3c/3d)
 
-**`pattern_embeddings`** — vec0 virtual table (sqlite-vec):
+1. **Module-level pending order map**: COs are tracked in a module-level `Map<string, ChangeOrder>`. Cleared per session. COs are keyed by UUID so concurrent requests don't collide.
 
-```
-pattern_id INTEGER PRIMARY KEY
-embedding float[<DIM>] distance_metric=cosine
-```
+2. **No LLM for CO descriptions**: Effect descriptions are built from static `EFFECT_DESCRIPTIONS` map + optional pattern store reverse lookup. This avoids adding inference latency to the consent elicitation path.
 
-Dimension is dynamic (determined at runtime from the embedding provider). Stored in meta as `embedding_dimension`. If the dimension changes, the vec0 table is dropped, rebuilt, and the `seeded` flag is reset so patterns are re-embedded.
+3. **Ambiguity as vector distance**: `assessRequestAmbiguity` uses the consent pattern store's similarity search. When the closest match exceeds the threshold (default 0.6), the request is flagged as ambiguous. This feeds into CO description enrichment and future EAA triggers (Phase 4).
 
-### Public Types
+4. **Per-session SQLite for consent records**: Each session gets its own database file under `~/.openclaw/agents/<agentId>/consent/`. This provides natural session isolation, easy cleanup on reset, and avoids cross-session data leakage.
 
-- **ConsentPatternSource**: `"seed" | "learned" | "admin"`
-- **ConsentPattern**: `{ id, text, effects, source, confidence, createdAt, updatedAt }`
-- **PatternSearchResult**: `{ pattern, distance }`
-- **ConsentPatternStore**: interface with all CRUD + search + meta + close methods
-- **OpenStoreParams**: `{ dbPath, embeddingDimension, injectedDb?, skipVecExtension? }`
+5. **Precedent reuse avoids redundant COs**: Before triggering a CO, callers can check `findConsentPrecedent` (exact effect match) or `findSimilarConsentPrecedent` (embedding similarity). If a prior granted, non-expired record covers the needed effects, it can be reused as an implicit anchor.
 
-### Functions
+6. **Read baseline preservation**: Revocation and withdrawal always preserve `"read"` as a minimum effect. The agent must always be able to communicate refusals or explain its state, even when all other effects are revoked.
 
-**`openConsentPatternStore(params)`** → `Promise<ConsentPatternStore>`
+7. **Dual revocation model**: User revocation (`revokeConsent`) invalidates from the requestor side. Agent withdrawal (`withdrawCommitment`) narrows scope from the agent side with categorized reasons and structured explanations. Both produce auditable consent records.
 
-- Creates/opens SQLite db, loads sqlite-vec extension, ensures schema, prepares statements
-- `injectedDb` and `skipVecExtension` for testing
+8. **Persistent store is optional**: All revocation/withdrawal functions accept `persistentStore?`. In-memory scope records are always updated; persistent writes are best-effort. This keeps the revocation path non-blocking even if the store is unavailable.
 
-**`seedConsentPatternStore({ store, seedData, embedder })`** → `Promise<number>`
+9. **Session reset preserves WO**: `resetConsentSession` clears consent and EAA records but leaves the active WO in place (it expires via TTL). Future tool calls must re-acquire consent through new COs.
 
-- Batch-embeds all seed texts via `embedder(texts: string[]): Promise<number[][]>`
-- Upserts each pattern with its embedding
-- Marks store as seeded (skips on subsequent calls)
-- Returns count of inserted patterns
+## What Remains
 
-**`resolveConsentStorePath(stateDir)`** → `string`
+### Phase 4: Elevated Action Analysis (EAA)
 
-- Deterministic: `${stateDir}/consent/consent-patterns.sqlite`
+- EAA trigger detection from ambiguity signal and high-risk effect combinations
+- LLM-based analysis of elevated actions with structured reasoning
+- EAA outcome integration into binder (approve/modify/refuse recommendations)
+- EAA record creation and persistence through consent store
+- Constraint recommendation from EAA outcomes
 
-**`resolveDefaultConsentStorePath()`** → `Promise<string>`
+### Phase 5: Standing Policy Framework
 
-- Async: imports `resolveStateDir` from config, then calls `resolveConsentStorePath`
+- Policy definition, storage, and lifecycle
+- Policy evaluation during WO minting
+- Policy-based automatic consent anchors
+- Policy conflict resolution
 
-### Store API Methods
+### Phase 6: Observability and Audit
 
-| Method                  | Signature                                                                             |
-| ----------------------- | ------------------------------------------------------------------------------------- |
-| `insertPattern`         | `(params) → ConsentPattern` — validates embedding dimension                           |
-| `upsertPattern`         | `(params) → ConsentPattern` — validates embedding dimension, updates existing by text |
-| `getPatternById`        | `(id) → ConsentPattern \| undefined`                                                  |
-| `getPatternByText`      | `(text) → ConsentPattern \| undefined`                                                |
-| `getAllPatterns`        | `() → ConsentPattern[]`                                                               |
-| `deletePattern`         | `(id) → boolean` — deletes embedding too                                              |
-| `searchSimilarPatterns` | `(embedding, k, threshold) → PatternSearchResult[]`                                   |
-| `getEmbeddingDimension` | `() → number \| undefined`                                                            |
-| `getPatternCount`       | `() → number`                                                                         |
-| `getMeta` / `setMeta`   | key-value metadata                                                                    |
-| `close`                 | closes the db connection                                                              |
-
-## implied-consent.ts (Orchestrator)
-
-### Types
-
-- **ImpliedConsentMode**: `"vector" | "heuristic" | "both"`
-- **ImpliedConsentConfig**: `{ provider?, model?, threshold?, topK?, mode? }`
-- **DeriveImpliedEffectsParams**: `{ requestText, consentConfig?, stateDir?, embeddingProvider?, store? }`
-
-### Constants
-
-| Constant          | Value               |
-| ----------------- | ------------------- |
-| DEFAULT_THRESHOLD | 0.35                |
-| DEFAULT_TOP_K     | 5                   |
-| DEFAULT_MODE      | "both"              |
-| DEFAULT_EFFECTS   | ["read", "compose"] |
-
-### Main Function
-
-**`deriveImpliedEffects(params)`** → `Promise<EffectClass[]>`
-
-1. If `mode === "heuristic"` → return `deriveEffectsFromHeuristic(requestText)` immediately
-2. Otherwise attempt `deriveVectorEffects(...)`:
-   - Resolve embedding provider (injected or via `listMemoryEmbeddingProviders()` auto-select)
-   - Get/create singleton store (lazy init: probe dimension → open store → seed)
-   - `provider.embedQuery(requestText)` → Float32Array
-   - `store.searchSimilarPatterns(vec, topK, threshold)` → union all matched pattern effects
-3. If `mode === "both"` → union vector results with heuristic results; on vector failure, heuristic only
-4. If `mode === "vector"` → return vector results; on failure, fall back to heuristic as safety net
-
-### Embedding Provider Resolution
-
-`resolveEmbeddingProvider(config)`:
-
-- Imports `listMemoryEmbeddingProviders()` dynamically
-- `provider: "auto"` (default): selects adapter with lowest `autoSelectPriority`
-- Explicit provider ID: uses `getMemoryEmbeddingProvider(id)`
-- Calls `adapter.create({ config: loadConfig(), model })` → `result.provider`
-
-### Store Lifecycle
-
-Singleton per process:
-
-- `_storePromise`: lazily created on first call, reused thereafter
-- `_storeSeeded`: flag to avoid re-seeding
-- `initStore()`: resolves db path → probe embedding dimension → `openConsentPatternStore()`
-- `ensureSeeded()`: calls `seedConsentPatternStore()` with `CONSENT_SEED_PATTERNS` and `provider.embedBatch`
-
-### Testing Seam (`__testing`)
-
-`resetStore()` — clears `_storePromise` and `_storeSeeded`; `storeSeeded` (getter); `mergeEffects(...arrays)`
-
-## integration.ts Changes
-
-**`initializeConsentForRun`** is now `async`:
-
-```typescript
-export async function initializeConsentForRun(
-  params: CreatePurchaseOrderParams & { env?: NodeJS.ProcessEnv },
-): Promise<ConsentRunContext | undefined>;
-```
-
-When `params.impliedEffects` is not provided:
-
-1. Dynamically imports `deriveImpliedEffects` from `./implied-consent.js`
-2. Loads `consent.impliedEffects` config from the main config (if available)
-3. Calls `deriveImpliedEffects({ requestText, stateDir, consentConfig })`
-4. On any failure, falls back to `FALLBACK_IMPLIED_EFFECTS` (`["read", "compose"]`)
-
-When `params.impliedEffects` IS provided, it is used directly (no derivation).
-
-`DEFAULT_IMPLIED_EFFECTS` renamed to `FALLBACK_IMPLIED_EFFECTS` in testing seam.
-
-## Configuration
-
-### types.openclaw.ts
-
-```typescript
-export type ConsentConfig = {
-  impliedEffects?: {
-    provider?: string; // Embedding provider ID. Default: "auto"
-    model?: string; // Embedding model override
-    threshold?: number; // Cosine distance threshold. Default: 0.35
-    topK?: number; // Number of similar patterns. Default: 5
-    mode?: "vector" | "heuristic" | "both"; // Default: "both"
-  };
-};
-```
-
-Added as `consent?: ConsentConfig` on `OpenClawConfig`.
-
-### zod-schema.ts
-
-All fields validated:
-
-- `threshold`: `z.number().min(0).max(2)`
-- `topK`: `z.number().int().min(1)`
-- `mode`: `z.union([z.literal("vector"), z.literal("heuristic"), z.literal("both")])`
-- Entire `consent` and `impliedEffects` objects use `.strict()`
-
-## Test Summary
-
-| File                              | Tests | Skipped | Coverage                                                       |
-| --------------------------------- | ----- | ------- | -------------------------------------------------------------- |
-| implied-consent-heuristic.test.ts | 15    | 0       | All 8 rules, compounds, case, dedup, defaults                  |
-| implied-consent-store.test.ts     | 13    | 11      | Schema, CRUD, vector search, threshold, dim validation, seed   |
-| implied-consent.test.ts           | 8     | 5       | Vector derivation, both-mode merging, fallback, heuristic-only |
-| integration.test.ts               | 17    | 0       | PO, enforcement, init (async), verify, e2e, fallback           |
-
-Skipped tests are guarded with `describe.runIf(sqliteAvailable && vecAvailable)` — they require the sqlite-vec native extension, which is not present in the default test environment. They pass when sqlite-vec is available.
-
-## Design Decisions
-
-1. **Vector + heuristic dual path**: vector search gives semantic understanding of novel phrasings; heuristic gives deterministic, explainable, always-available baseline. "both" mode unions them for best coverage.
-
-2. **sqlite-vec over separate vector DB**: single portable file, existing codebase dependency (memory-host-sdk already uses it), no additional service to manage.
-
-3. **Singleton store per process**: consent pattern store is opened once and reused. Seeding happens once. Avoids per-request db open overhead.
-
-4. **Dimension probing**: embedding dimension is determined at runtime by embedding a probe string, not hardcoded. Supports any embedding model transparently.
-
-5. **Dimension change handling**: if the embedding provider changes (different model → different dimension), the vec0 table is dropped and rebuilt, and the seeded flag is reset so all patterns are re-embedded automatically.
-
-6. **Lazy dynamic imports**: `implied-consent.js`, `config.js`, and `memory-embedding-providers.js` are all dynamically imported to avoid circular dependencies and keep the consent module tree-shakeable.
-
-7. **Graceful degradation chain**: vector search failure → heuristic → static default. The system never blocks on consent infrastructure failures.
-
-8. **Config passthrough**: `consent.impliedEffects` config keys are loaded from the main config inside `initializeConsentForRun` and passed to the orchestrator, so users can tune threshold/topK/mode/provider without code changes.
-
-9. **Seed data as code**: the 95 seed patterns live in `implied-consent-seed.ts` as a typed constant, not in an external file. This ensures type safety, version control, and easy contribution.
-
-10. **Conservative seed set**: seed patterns are intentionally broad and conservative. The binder's ceiling checks and system prohibitions catch over-granting downstream, so it's safer to derive more effects than fewer.
-
-## What Remains in Phase 3
-
-### 3b. Change Order (Explicit Consent) Flow
-
-- Create `src/consent/change-order.ts` for CO request/resolve lifecycle
-- Gateway protocol schemas in `src/gateway/protocol/schema/consent.ts`
-- Generalize `ExecApprovalManager` into consent elicitation
-- When `verifyToolConsent` returns `allowed: false` in enforce mode, the orchestrator triggers a CO instead of hard refusal
-- On CO grant: `mintSuccessorWorkOrder` → `transitionWorkOrder` → retry tool
-- On CO deny: agent must replan within current WO or refuse
-- UI surface for consent approval (displays in effect terms)
-
-### 3c. Consent Record Persistence
-
-- Create `src/consent/consent-store.ts`
-- Store per-session at `~/.openclaw/agents/<agentId>/consent/`
-- Persist `ConsentRecord` and `EAARecord` for anchor verification and audit
-- Records used by binder's `verifyConsentAnchorAgainstRecords` for explicit/eaa anchor validation
-
-### 3d. Revocation and Withdrawal
-
-- Wire into `/cancel` and session reset flows
-- Invalidate active WOs on revocation
-- Clear consent records on withdrawal
-- Emit scope chain events for observability (Phase 6 forward compat)
+- Scope chain event emission
+- Consent decision audit log
+- WO chain visualization
+- Consent flow metrics

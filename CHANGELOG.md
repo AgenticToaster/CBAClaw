@@ -3,6 +3,47 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.4.0 — 2026-04-02
+
+Phase 3b/3c/3d: Change Order flow, consent record persistence, and revocation/withdrawal.
+
+### Phase 3b: Change Order Lifecycle (`src/consent/change-order.ts`)
+
+- `requestChangeOrder`: creates a pending CO with human-readable effect descriptions when a tool call requires effects not covered by the active WO.
+- `resolveChangeOrder`: handles grant (mints successor WO, transitions scope) or deny (CO marked denied, agent must replan).
+- `generateEffectDescription`: builds CO approval descriptions from static effect descriptions plus optional pattern store examples, without LLM calls.
+- `findPatternsForEffects`: reverse pattern lookup — given missing EffectClass values, finds matching patterns in the consent pattern store for grounding CO descriptions.
+- `assessRequestAmbiguity`: uses vector search distance as a quantified ambiguity signal. When the closest pattern match exceeds the ambiguity threshold (default 0.6), the request is flagged as underspecified. Feeds into EAA trigger detection (Phase 4).
+- CO lifecycle transitions: `expireChangeOrder`, `withdrawChangeOrder`, `getPendingChangeOrder`, `getAllPendingChangeOrders`.
+- High-risk effect detection for enriched CO descriptions when ambiguity is present.
+
+### Phase 3c: Consent Record Persistence (`src/consent/consent-store.ts`)
+
+- Persistent SQLite store for consent records and EAA records at `~/.openclaw/agents/<agentId>/consent/consent-records.sqlite`.
+- `openConsentRecordStore`: factory with schema creation, optional sqlite-vec for similarity search, WAL journaling.
+- Full CRUD: `insertConsentRecord`, `getConsentRecord`, `getConsentRecordsByPO`, `getConsentRecordsByDecision`, `getAllConsentRecords`, `updateConsentDecision`.
+- EAA record persistence: `insertEAARecord`, `getEAARecord`, `getAllEAARecords`.
+- `findConsentPrecedent`: exact effect-set matching for consent precedent reuse — finds the most recent granted, non-expired record whose effects are a superset of the requested effects.
+- `findSimilarConsentPrecedent`: embedding-based similarity search for semantic precedent reuse (requires sqlite-vec). Conservative: requires effect superset, tight distance threshold (0.25), and non-expired record.
+- `upsertConsentEmbedding`: stores embeddings for consent records to enable similarity search.
+- `clearAll`: clears all records for session reset/revocation.
+- Path resolution: `resolveConsentRecordStorePath`, `resolveDefaultConsentRecordStorePath`.
+
+### Phase 3d: Revocation and Withdrawal (`src/consent/revocation.ts`)
+
+- `revokeConsent`: user-initiated consent revocation. Invalidates the active WO and transitions scope to a restricted WO (read-only baseline). Supports full revocation (`scope: "all"`) and targeted revocation (`scope: "effects"` with specific effect classes). Marks existing granted consent records as revoked.
+- `withdrawCommitment`: agent-initiated withdrawal from current commitments. Categorized reasons: `constraint-change`, `duty-conflict`, `capability-insufficient`, `safety-concern`, `other`. Produces auditable records and human-readable explanations.
+- `resetConsentSession`: clears all in-memory consent and EAA records for session reset. Optionally clears the persistent store. Preserves the active WO (expires naturally via TTL).
+- Both revocation and withdrawal preserve "read" as the minimum operational capability so the agent can still communicate refusals.
+
+### Phase 3b/3c/3d: Tests
+
+- `src/consent/change-order.test.ts`: 27 tests — effect description generation (single/multiple/empty/ambiguous), pattern lookup, CO creation/denial/grant/scope transition, consent record creation on grant, CO lifecycle transitions (expire/withdraw), ambiguity assessment (close match/far/empty/failure/custom threshold).
+- `src/consent/consent-store.test.ts`: 25 tests — consent record CRUD (insert/retrieve/by-PO/by-decision/all), decision updates, metadata and expiry round-trips, EAA record CRUD, consent precedent matching (exact effect coverage, denied/expired exclusion, most recent match), clearAll.
+- `src/consent/revocation.test.ts`: 16 tests — full revocation (scope transition, consent records, restricted WO), targeted revocation (specific effects), record marking, agent withdrawal (all reasons, specific effects, audit records), session reset.
+
+---
+
 ## 0.3.0 — 2026-04-02
 
 Phase 3a: Vector-based implied consent derivation with SQLite + sqlite-vec pattern store.

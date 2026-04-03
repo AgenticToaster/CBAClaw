@@ -16,13 +16,13 @@ todos:
     status: completed
   - id: phase-3b-change-order
     content: "Change Order flow: generalize exec/plugin approval manager, gateway methods, protocol schemas, UI surface, CO effect description via pattern store reverse lookup, request ambiguity detection via vector distance"
-    status: pending
+    status: completed
   - id: phase-3c-consent-records
     content: "Consent record persistence: per-session store, binder anchor verification, consent precedent reuse via similarity search to skip redundant CO prompts"
-    status: pending
+    status: completed
   - id: phase-3d-revocation
     content: "Revocation and withdrawal: /cancel and session reset wiring, WO invalidation, consent record cleanup"
-    status: pending
+    status: completed
   - id: phase-4-eaa
     content: "Build Elevated Action Analysis: trigger detection (uses ambiguity score from 3b), structured adjudication loop, EAA artifact production, system prompt updates for consent-aware agent behavior"
     status: pending

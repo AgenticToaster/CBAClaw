@@ -106,3 +106,43 @@ export {
 export { deriveEffectsFromHeuristic } from "./implied-consent-heuristic.js";
 export { CONSENT_SEED_PATTERNS } from "./implied-consent-seed.js";
 export type { ConsentSeedEntry } from "./implied-consent-seed.js";
+
+// Phase 3b: Change Order Lifecycle
+export type {
+  AmbiguityAssessment,
+  RequestChangeOrderParams,
+  RequestChangeOrderResult,
+  ResolveChangeOrderParams,
+  ResolveChangeOrderResult,
+} from "./change-order.js";
+export {
+  assessRequestAmbiguity,
+  expireChangeOrder,
+  findPatternsForEffects,
+  generateEffectDescription,
+  getAllPendingChangeOrders,
+  getPendingChangeOrder,
+  requestChangeOrder,
+  resolveChangeOrder,
+  withdrawChangeOrder,
+} from "./change-order.js";
+
+// Phase 3c: Consent Record Persistence
+export type { ConsentRecordStore, OpenConsentRecordStoreParams } from "./consent-store.js";
+export {
+  openConsentRecordStore,
+  resolveConsentRecordStorePath,
+  resolveDefaultConsentRecordStorePath,
+} from "./consent-store.js";
+
+// Phase 3d: Revocation and Withdrawal
+export type {
+  RevocationResult,
+  RevocationScope,
+  RevokeConsentParams,
+  SessionResetResult,
+  WithdrawalReason,
+  WithdrawalResult,
+  WithdrawCommitmentParams,
+} from "./revocation.js";
+export { resetConsentSession, revokeConsent, withdrawCommitment } from "./revocation.js";
