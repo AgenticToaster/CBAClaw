@@ -3,6 +3,38 @@
 This changelog tracks changes specific to CBAClaw (Consent-Bound Agency).
 For the upstream OpenClaw changelog, see [CHANGELOG.openclaw.md](./CHANGELOG.openclaw.md).
 
+## 0.6.0 — 2026-04-02
+
+Phase 4b: Elevated Action Analysis (EAA) adjudication loop.
+
+### Phase 4b: EAA Adjudication Loop (`src/consent/eaa.ts`)
+
+- `runElevatedActionAnalysis`: async 6-step adjudication loop that forms the agent's commitment under uncertainty. Accepts a `PurchaseOrder`, active `WorkOrder`, tool profile, trigger result, consent/EAA history, duty constraints, and an injected `EAAInferenceFn` for the LLM evaluation step. All steps except inference are deterministic.
+- Step 1 — **Classify action and affected parties**: determines `ActionCategory` (routine / sensitive / high-risk / emergency) from effect profiles and trigger context. Identifies affected parties (requestor, named-third-party, bystander, unknown) and their interests (property, privacy, safety, communication, autonomy).
+- Step 2 — **Constrained discovery**: gathers minimal deterministic context (request metadata, tool profile, WO grants, prior EAA outcomes, granted consent summaries with expiry tracking, active duty constraints). No LLM calls, no effects beyond the active WO.
+- Step 3 — **Evaluate standing, risk, and duties**: delegated to the injected `EAAInferenceFn`. Returns a structured `EAAEvaluation` with standing confidence (0–1), risk assessment (likelihood, severity, mitigating/aggravating factors), duty analysis (applicable duties, conflicts with resolutions), and confidence gating (overall confidence, insufficient evidence areas). The loop validates the returned evaluation structurally (numeric bounds, severity enum).
+- Step 4 — **Select least invasive sufficient action**: generates ranked `ActionAlternative` candidates scored by invasiveness. Hard rules: inviolable duty collisions block proceed/constrained-comply/request-consent (but NOT emergency-act). Constrained-comply strips irreversible effects when risk is serious. Emergency-act only for emergency classifications. Proceed requires high confidence (>= 0.7) + low risk (negligible/minor) + trigger severity < 0.8.
+- Step 5 — **Choose explicit outcome**: deterministic priority ladder: emergency overrides inviolable collision → inviolable collision (non-emergency) → refuse → low confidence (< 0.3) → request-consent → emergency-time-pressure → emergency-act → high confidence + low risk → proceed → moderate confidence → constrained-comply → fallback request-consent → refuse.
+- Step 6 — **Produce accountability artifacts**: three cross-referenced outputs sharing the same ID:
+  - `EAAAdjudicationResult`: bounded schema for the binder (outcome, recommended effects, recommended constraints, reasoning record reference).
+  - `EAAReasoningRecord`: full audit bundle (trigger categories, classification, discovery context, evaluation, all alternatives, selected alternative, justification text, evidence references including tool/consent/duty pointers).
+  - `EAARecord`: for the consent store (links to PO/WO, outcome, recommended effects/constraints, serialized reasoning).
+- Failure handling:
+  - LLM inference failure → `ok: false` with `refuse` fallback and structured explanation.
+  - Structurally invalid evaluation → `ok: false` with `refuse` fallback.
+  - Low overall confidence (< 0.3) → `request-consent` outcome (ask the user rather than guess).
+  - Inviolable duty collision (non-emergency) → `refuse` outcome.
+  - Emergency with inviolable collision → `emergency-act` with strict 5-minute time-bounded constraints.
+- Constants: `LOW_CONFIDENCE_THRESHOLD` (0.3), `EMERGENCY_TTL_MS` (5 min), `CONSTRAINED_COMPLY_TTL_MS` (15 min).
+- Testable clock and ID generation seams for deterministic tests.
+- Testing seam exposing all internal step functions, helpers, and constants.
+
+### Phase 4b: Tests
+
+- `src/consent/eaa.test.ts`: 58 tests — Step 1 classification (routine/sensitive/high-risk/emergency categories, requestor/third-party/bystander/unknown affected parties, interest derivation, autonomy fallback), Step 2 discovery context (metadata aggregation, prior EAA summaries, consent expiry tracking), Step 3 validation (well-formed acceptance, all boundary rejections: confidence < 0 / > 1, invalid severity, likelihood > 1, overall confidence > 1), Step 4 alternatives (refuse/escalate always present, request-consent gating, inviolable collision exclusions, proceed eligibility, trigger severity gate, constrained-comply confidence/risk gates, emergency-act classification gate, emergency-act survives inviolable collision, irreversible stripping at serious risk, sort order), Step 5 outcome selection (inviolable non-emergency refuse, emergency overrides inviolable, low confidence request-consent, low confidence refuse fallback, emergency-act selection, high confidence proceed, moderate constrained-comply, fallback request-consent), inviolable duty collision helper, invasiveness scoring, minimal emergency effects, Step 6 artifact production (cross-referenced IDs, evidence refs with tool/consent/duty, serialized reasoning), end-to-end adjudication (proceed, constrained-comply, request-consent, emergency-act with default duties, inviolable refuse), failure cases (inference failure, invalid evaluation), artifact integrity (ID cross-references, serialized reasoning, justification content), testing seam constants.
+
+---
+
 ## 0.5.0 — 2026-04-02
 
 Phase 4a: Elevated Action Analysis (EAA) trigger detection.

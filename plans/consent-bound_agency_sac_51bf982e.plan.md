@@ -28,7 +28,7 @@ todos:
     status: completed
   - id: phase-4b-adjudication
     content: "EAA adjudication loop: 6-step structured process (classify, discover, evaluate via LLM, select least invasive action, choose outcome, produce artifacts). Two artifacts: EAAAdjudicationResult (bounded, to binder) + EAAReasoningRecord (opaque, for audit). Inject LLM via EAAInferenceFn."
-    status: pending
+    status: completed
   - id: phase-4c-integration
     content: "EAA orchestration integration: handleConsentFailure wiring into verifyToolConsent failure path, precedent reuse check, EAA-to-CO handoff for request-consent outcome, binder anchor verification for eaa anchors, successor WO minting from adjudication results"
     status: pending

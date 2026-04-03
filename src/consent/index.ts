@@ -157,3 +157,20 @@ export type {
   EvaluateEAATriggersParams,
 } from "./eaa-triggers.js";
 export { DEFAULT_DUTY_CONSTRAINTS, evaluateEAATriggers } from "./eaa-triggers.js";
+
+// Phase 4b: EAA Adjudication Loop
+export type {
+  ActionAlternative,
+  ActionCategory,
+  ActionClassification,
+  AffectedParty,
+  DutyConflict,
+  EAAAdjudicationResult,
+  EAAEvaluation,
+  EAAInferenceFn,
+  EAAReasoningRecord,
+  EAARunParams,
+  EAARunResult,
+  RiskSeverity,
+} from "./eaa.js";
+export { runElevatedActionAnalysis } from "./eaa.js";
